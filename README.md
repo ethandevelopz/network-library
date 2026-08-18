@@ -17,6 +17,7 @@ This library is engineered to handle complex data flow, packet routing, and stat
 The following Roblox games and projects have explicit, written authorization from the author to utilize this network library in production:
 
 * [Georgia State Roleplay](https://www.roblox.com/communities/34436342/Georgia-State-Roleplay)
+* [PixelByte Interactive](https://www.roblox.com/communities/984186223/PixelByte-Interactive#!/about)
 
 *(Note: Unlisted games or studios using this library without direct authorization are in violation of the repository license.)*
 
