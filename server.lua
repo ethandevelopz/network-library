@@ -282,7 +282,7 @@ function net.loadEvent(eventName: string, options: { unreliable: boolean?, rateL
 	end
 	local eventId = getOrCreateEventId(eventName)
 	local unreliable = options and options.unreliable or false
-	local rateLimit = options and options.rateLimit
+	local rateLimit = options and options.rateLimit or 5
 	local eventApi = {} :: any
 	eventApi.onServerFire = signalModule.new()
 	eventApi.rateLimit = rateLimit
