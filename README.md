@@ -23,10 +23,6 @@ This library powers production environments in the following Roblox communities:
 
 ---
 
-## License
-
-This project is open-source and available under the terms of the [MIT License](LICENSE.md). Feel free to use, modify, and distribute it in your own indie or commercial projects.
-
 ## Contact
 
 * **Discord:** `ethanmracing`
