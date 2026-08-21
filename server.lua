@@ -280,34 +280,42 @@ function net.loadEvent(eventName: string, options: { unreliable: boolean?, rateL
 	if registeredEvents[eventName] then
 		return registeredEvents[eventName]
 	end
+	
 	local eventId = getOrCreateEventId(eventName)
 	local unreliable = options and options.unreliable or false
 	local rateLimit = options and options.rateLimit or 5
 	local eventApi = {} :: any
 	eventApi.onServerFire = signalModule.new()
 	eventApi.rateLimit = rateLimit
+	
 	function eventApi:FireClient(player, ...)
 		local args = {...}
 		queueForPlayer(player, eventId, codec.pack(args), unreliable)
 	end
+	
 	function eventApi:FireAll(...)
 		local args = {...}
 		queueForAll(eventId, codec.pack(args), unreliable)
 	end
+	
 	function eventApi:FireExcept(excludedPlayer, ...)
 		local args = {...}
 		queueForExcept(excludedPlayer, eventId, codec.pack(args), unreliable)
 	end
+	
 	function eventApi:FireList(players, ...)
 		local args = {...}
 		queueForList(players, eventId, codec.pack(args), unreliable)
 	end
+	
 	function eventApi:Connect(callback)
 		return eventApi.onServerFire:connect(callback)
 	end
+	
 	function eventApi:Once(callback)
 		return eventApi.onServerFire:once(callback)
 	end
+	
 	registeredEvents[eventName] = eventApi
 	return eventApi
 end
