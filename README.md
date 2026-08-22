@@ -23,8 +23,8 @@ To set up the networking library in your Roblox place, follow the file structure
 * **ReplicatedStorage (`ReplicatedStorage.Network`)**
   * Place the **Modules** folder inside `Network`.
   * Place **`Client.lua`** inside `Network`.
-  * Place **`__Master`** (`RemoteEvent`) inside `Network`.
-  * Place **`__MasterUnreliable`** (`UnreliableRemoteEvent`) inside `Network`.
+  * Create **`__Master`** (`RemoteEvent`) inside `Network`.
+  * Create **`__MasterUnreliable`** (`UnreliableRemoteEvent`) inside `Network`.
 
 * **ServerScriptService (`ServerScriptService.Network`)**
   * Place **`Server.lua`** inside `Network`.
