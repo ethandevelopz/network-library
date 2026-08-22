@@ -14,6 +14,23 @@ This library is engineered to handle complex data flow, packet routing, and stat
 * **Clean Architecture:** Strict separation of concerns, avoiding instance spam and unnecessary property polling.
 * **Reliable & Unreliable Routing:** Structured packet handling built for heavy simulation and high-CCU environments, including rate-limiting and auto-syncing.
 
+---
+
+## Installation & Setup
+
+To set up the networking library in your Roblox place, follow the file structure and placement guidelines below:
+
+* **ReplicatedStorage (`ReplicatedStorage.Network`)**
+  * Place the **Modules** folder inside `Network`.
+  * Place **`Client.lua`** inside `Network`.
+  * Place **`__Master`** (`RemoteEvent`) inside `Network`.
+  * Place **`__MasterUnreliable`** (`UnreliableRemoteEvent`) inside `Network`.
+
+* **ServerScriptService (`ServerScriptService.Network`)**
+  * Place **`Server.lua`** inside `Network`.
+
+---
+
 ## Production Showcase / Authorized Environments
 
 This library powers production environments in the following Roblox communities:
