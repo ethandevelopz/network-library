@@ -42,13 +42,13 @@ local function flushReliable()
 	if #reliableQueue == 0 then
 		return
 	end
-	
+
 	local writer = bufferWriter.new()
 	writer:writeVarUInt(#reliableQueue)
 	for _, message in ipairs(reliableQueue) do
 		writeMessageWithId(writer, message)
 	end
-	
+
 	statsSent.messages += #reliableQueue
 	table.clear(reliableQueue)
 	local outgoingBuffer = writer:toBuffer()
@@ -60,13 +60,13 @@ local function flushUnreliable()
 	if #unreliableQueue == 0 then
 		return
 	end
-	
+
 	local writer = bufferWriter.new()
 	writer:writeVarUInt(#unreliableQueue)
 	for _, message in ipairs(unreliableQueue) do
 		writeMessageWithId(writer, message)
 	end
-	
+
 	statsSent.messages += #unreliableQueue
 	table.clear(unreliableQueue)
 	local outgoingBuffer = writer:toBuffer()
@@ -100,7 +100,7 @@ local function dispatchMessage(kind, eventName, payload, unreliable, requestId)
 		})
 		return
 	end
-	
+
 	local message = { kind = kind, id = eventId, requestId = requestId, payload = payload }
 	if unreliable then
 		queueUnreliable(message)
@@ -113,7 +113,7 @@ local function resolvePending()
 	if #pendingQueue == 0 then
 		return
 	end
-	
+
 	local stillPending = {}
 	for _, entry in ipairs(pendingQueue) do
 		local eventId = idByName[entry.name]
@@ -147,7 +147,7 @@ local function processIncoming(packedBuffer)
 		nameById[eventId] = eventName
 		idByName[eventName] = eventId
 	end
-	
+
 	local messageCount = reader:readVarUInt()
 	statsReceived.messages += messageCount
 	for _ = 1, messageCount do
@@ -169,7 +169,8 @@ local function processIncoming(packedBuffer)
 			local eventObject = eventName and registeredEvents[eventName]
 			if eventObject and eventObject.onClientInvoke then
 				task.spawn(function()
-					local success, result = pcall(eventObject.onClientInvoke, codec.unpack(payload))
+					local unpackedPayload = codec.unpack(payload)
+					local success, result = pcall(eventObject.onClientInvoke, table.unpack(unpackedPayload))
 					queueReliable({ kind = kindResponse, requestId = requestId, success = success, payload = codec.pack(result) })
 					flushReliable()
 				end)
@@ -181,7 +182,8 @@ local function processIncoming(packedBuffer)
 			local thread = pendingRequests[requestId]
 			if thread then
 				pendingRequests[requestId] = nil
-				task.spawn(thread, success, codec.unpack(payload))
+				local unpackedPayload = codec.unpack(payload)
+				task.spawn(thread, success, table.unpack(unpackedPayload))
 			end
 		end
 	end
@@ -192,7 +194,7 @@ local function processIncomingUnreliable(packedBuffer)
 	statsReceived.bytes += buffer.len(packedBuffer)
 	local messageCount = reader:readVarUInt()
 	statsReceived.messages += messageCount
-	
+
 	for _ = 1, messageCount do
 		local kind = reader:readUInt8()
 		local eventId = reader:readVarUInt()
@@ -202,7 +204,7 @@ local function processIncomingUnreliable(packedBuffer)
 			local eventObject = eventName and registeredEvents[eventName]
 			if eventObject and eventObject.onClientFire then
 				local unpackedPayload = codec.unpack(payload)
-				eventObject.onClientFire:fire(codec.unpack(unpackedPayload))
+				eventObject.onClientFire:fire(table.unpack(unpackedPayload))
 			end
 		end
 	end
@@ -218,7 +220,7 @@ function net.loadEvent(eventName: string, options: { unreliable: boolean? }?): C
 	if registeredEvents[eventName] then
 		return registeredEvents[eventName]
 	end
-	
+
 	local unreliable = options and options.unreliable or false
 	local eventApi = {} :: any
 	eventApi.onClientFire = signalModule.new()
@@ -226,15 +228,15 @@ function net.loadEvent(eventName: string, options: { unreliable: boolean? }?): C
 		local data = {...}
 		dispatchMessage(kindEvent, eventName, codec.pack(data), unreliable, nil)
 	end
-	
+
 	function eventApi:Connect(callback)
 		return eventApi.onClientFire:connect(callback)
 	end
-	
+
 	function eventApi:Once(callback)
 		return eventApi.onClientFire:once(callback)
 	end
-	
+
 	registeredEvents[eventName] = eventApi
 	return eventApi
 end
@@ -248,12 +250,12 @@ function net.loadFunction(eventName: string): ClientFunctionApi
 	if registeredEvents[eventName] then
 		return registeredEvents[eventName]
 	end
-	
+
 	local eventApi = {} :: any
 	function eventApi:OnInvoke(callback)
 		eventApi.onClientInvoke = callback
 	end
-	
+
 	function eventApi:InvokeServer(...)
 		local data = {...}
 		local timeoutSeconds = 3
@@ -274,7 +276,7 @@ function net.loadFunction(eventName: string): ClientFunctionApi
 		task.cancel(timeoutHandle)
 		return success, result
 	end
-	
+
 	registeredEvents[eventName] = eventApi
 	return eventApi
 end
