@@ -245,7 +245,8 @@ local function processIncoming(player, packedBuffer)
 			local eventObject = eventName and registeredEvents[eventName]
 			if eventObject and eventObject.onServerInvoke then
 				task.spawn(function()
-					local success, result = pcall(eventObject.onServerInvoke, player, codec.unpack(payload))
+					local unpackedPayload = codec.unpack(payload)
+					local success, result = pcall(eventObject.onServerInvoke, player, table.unpack(unpackedPayload))
 					queueReliable(player, {
 						kind = kindResponse,
 						requestId = requestId,
@@ -261,7 +262,8 @@ local function processIncoming(player, packedBuffer)
 			local thread = pendingRequests[requestId]
 			if thread then
 				pendingRequests[requestId] = nil
-				task.spawn(thread, success, codec.unpack(payload))
+				local unpackedPayload = codec.unpack(payload)
+				task.spawn(thread, success, table.unpack(unpackedPayload))
 			end
 		end
 	end
