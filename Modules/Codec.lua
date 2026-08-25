@@ -339,11 +339,13 @@ function codec.defineSchema(name, fields)
 				fieldWriters[field.type](writer, ctx, data[field.name])
 			end
 		end)
+		
 		if not success then
 			warn('codec schema pack failed for "' .. name .. '": ' .. tostring(result))
 			releaseWriter(writer)
 			return buffer.create(1)
 		end
+		
 		local packedBuffer = writer:toBuffer()
 		releaseWriter(writer)
 		return packedBuffer
@@ -356,10 +358,12 @@ function codec.defineSchema(name, fields)
 			assert(tag == tagByte, 'codec schema mismatch decoding "' .. name .. '"')
 			return schema._decodeFields(reader)
 		end)
+		
 		releaseReader(reader)
 		if success then
 			return result
 		end
+		
 		warn('codec schema unpack failed for "' .. name .. '": ' .. tostring(result))
 		return nil
 	end
