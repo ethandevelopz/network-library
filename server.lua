@@ -24,6 +24,7 @@ local kindRequest = 1
 local kindResponse = 2
 local reliableFlushThreshold = 24
 local unreliableFlushThreshold = 32
+local maxMessagesPerPacket = 256
 local masterRemote = network.__Master
 local masterUnreliableRemote = network.__MasterUnreliable
 
@@ -50,11 +51,11 @@ end)
 
 local function getOrCreateEventId(eventName)
 	local eventId = idByName[eventName]
-	
+
 	if eventId then
 		return eventId
 	end
-	
+
 	eventId = nextEventId
 	nextEventId += 1
 	idByName[eventName] = eventId
@@ -64,13 +65,13 @@ local function getOrCreateEventId(eventName)
 			table.insert(unsyncedIdsByPlayer[player], eventId)
 		end
 	end
-	
+
 	return eventId
 end
 
 local function writeMessageWithId(writer, message)
 	writer:writeUInt8(message.kind)
-	
+
 	if message.kind == kindResponse then
 		writer:writeVarUInt(message.requestId)
 		writer:writeUInt8(message.success and 1 or 0)
@@ -91,24 +92,24 @@ local function flushPlayerReliable(player)
 	if not queue or not pendingIds then
 		return
 	end
-	
+
 	if #queue == 0 and #pendingIds == 0 then
 		return
 	end
-	
+
 	local writer = bufferWriter.new()
 	writer:writeVarUInt(#pendingIds)
 	for _, eventId in ipairs(pendingIds) do
 		writer:writeVarUInt(eventId)
 		writer:writeString(nameById[eventId])
 	end
-	
+
 	table.clear(pendingIds)
 	writer:writeVarUInt(#queue)
 	for _, message in ipairs(queue) do
 		writeMessageWithId(writer, message)
 	end
-	
+
 	statsSent.messages += #queue
 	table.clear(queue)
 	local outgoingBuffer = writer:toBuffer()
@@ -121,13 +122,13 @@ local function flushPlayerUnreliable(player)
 	if not queue or #queue == 0 then
 		return
 	end
-	
+
 	local writer = bufferWriter.new()
 	writer:writeVarUInt(#queue)
 	for _, message in ipairs(queue) do
 		writeMessageWithId(writer, message)
 	end
-	
+
 	statsSent.messages += #queue
 	table.clear(queue)
 	local outgoingBuffer = writer:toBuffer()
@@ -141,7 +142,7 @@ local function queueReliable(player, message)
 		initializePlayerState(player)
 		queue = reliableQueueByPlayer[player]
 	end
-	
+
 	table.insert(queue, message)
 	if #queue >= reliableFlushThreshold then
 		flushPlayerReliable(player)
@@ -154,7 +155,7 @@ local function queueUnreliable(player, message)
 		initializePlayerState(player)
 		queue = unreliableQueueByPlayer[player]
 	end
-	
+
 	table.insert(queue, message)
 	if #queue >= unreliableFlushThreshold then
 		flushPlayerUnreliable(player)
@@ -201,71 +202,103 @@ local function checkRateLimit(eventName, player, maxPerSecond)
 	if not maxPerSecond then
 		return true
 	end
-	
+
 	local perEvent = rateLimitState[eventName]
 	if not perEvent then
 		perEvent = {}
 		rateLimitState[eventName] = perEvent
 	end
-	
+
 	local state = perEvent[player]
 	local now = os.clock()
 	if not state or now - state.windowStart >= 1 then
 		state = { count = 0, windowStart = now }
 		perEvent[player] = state
 	end
-	
+
 	state.count += 1
 	return state.count <= maxPerSecond
 end
 
-local function processIncoming(player, packedBuffer)
-	local reader = bufferReader.new(packedBuffer)
-	statsReceived.bytes += buffer.len(packedBuffer)
-	local messageCount = reader:readVarUInt()
-	statsReceived.messages += messageCount
-	for _ = 1, messageCount do
-		local kind = reader:readUInt8()
-		if kind == kindEvent then
-			local eventId = reader:readVarUInt()
-			local payload = reader:readBuffer()
-			local eventName = nameById[eventId]
-			local eventObject = eventName and registeredEvents[eventName]
-			if eventObject and eventObject.onServerFire then
-				if checkRateLimit(eventName, player, eventObject.rateLimit) then
-					local unpackedPayload = codec.unpack(payload)
-					eventObject.onServerFire:fire(player, table.unpack(unpackedPayload))
-				end
+local function handleMessage(player, kind, reader)
+	if kind == kindEvent then
+		local eventId = reader:readVarUInt()
+		local payload = reader:readBuffer()
+		local eventName = nameById[eventId]
+		local eventObject = eventName and registeredEvents[eventName]
+		if eventObject and eventObject.onServerFire then
+			if checkRateLimit(eventName, player, eventObject.rateLimit) then
+				local unpackedPayload = codec.unpack(payload)
+				eventObject.onServerFire:fire(player, table.unpack(unpackedPayload or {}))
 			end
-		elseif kind == kindRequest then
-			local eventId = reader:readVarUInt()
-			local requestId = reader:readVarUInt()
-			local payload = reader:readBuffer()
-			local eventName = nameById[eventId]
-			local eventObject = eventName and registeredEvents[eventName]
-			if eventObject and eventObject.onServerInvoke then
+		end
+	elseif kind == kindRequest then
+		local eventId = reader:readVarUInt()
+		local requestId = reader:readVarUInt()
+		local payload = reader:readBuffer()
+		local eventName = nameById[eventId]
+		local eventObject = eventName and registeredEvents[eventName]
+		if eventObject and eventObject.onServerInvoke then
+			if checkRateLimit(eventName, player, eventObject.rateLimit) then
+				local unpackedPayload = codec.unpack(payload)
 				task.spawn(function()
-					local unpackedPayload = codec.unpack(payload)
-					local success, result = pcall(eventObject.onServerInvoke, player, table.unpack(unpackedPayload))
+					local returned = table.pack(pcall(eventObject.onServerInvoke, player, unpackedPayload))
+					local success = returned[1]
+					local results = table.pack(table.unpack(returned, 2, returned.n))
 					queueReliable(player, {
 						kind = kindResponse,
 						requestId = requestId,
 						success = success,
-						payload = codec.pack(result),
+						payload = codec.pack(results),
 					})
 				end)
-			end
-		elseif kind == kindResponse then
-			local requestId = reader:readVarUInt()
-			local success = reader:readUInt8() == 1
-			local payload = reader:readBuffer()
-			local thread = pendingRequests[requestId]
-			if thread then
-				pendingRequests[requestId] = nil
-				local unpackedPayload = codec.unpack(payload)
-				task.spawn(thread, success, table.unpack(unpackedPayload))
+			else
+				queueReliable(player, {
+					kind = kindResponse,
+					requestId = requestId,
+					success = false,
+					payload = codec.pack({ 'rate_limited' }),
+				})
 			end
 		end
+	elseif kind == kindResponse then
+		local requestId = reader:readVarUInt()
+		local success = reader:readUInt8() == 1
+		local payload = reader:readBuffer()
+		local thread = pendingRequests[requestId]
+		if thread then
+			pendingRequests[requestId] = nil
+			local unpackedPayload = codec.unpack(payload)
+			task.spawn(thread, success, table.unpack(unpackedPayload or {}))
+		end
+	else
+		error('unknown message kind ' .. tostring(kind))
+	end
+end
+
+local function processIncoming(player, packedBuffer)
+	if typeof(packedBuffer) ~= 'buffer' then
+		return
+	end
+
+	local success, err = pcall(function()
+		local reader = bufferReader.new(packedBuffer)
+		statsReceived.bytes += buffer.len(packedBuffer)
+		local messageCount = reader:readVarUInt()
+
+		if messageCount > maxMessagesPerPacket then
+			error('messageCount ' .. messageCount .. ' exceeds max ' .. maxMessagesPerPacket)
+		end
+
+		statsReceived.messages += messageCount
+		for _ = 1, messageCount do
+			local kind = reader:readUInt8()
+			handleMessage(player, kind, reader)
+		end
+	end)
+
+	if not success then
+		warn('processIncoming failed for player ' .. player.Name .. ': ' .. tostring(err))
 	end
 end
 
@@ -282,42 +315,42 @@ function net.loadEvent(eventName: string, options: { unreliable: boolean?, rateL
 	if registeredEvents[eventName] then
 		return registeredEvents[eventName]
 	end
-	
+
 	local eventId = getOrCreateEventId(eventName)
 	local unreliable = options and options.unreliable or false
 	local rateLimit = options and options.rateLimit or 5
 	local eventApi = {} :: any
 	eventApi.onServerFire = signalModule.new()
 	eventApi.rateLimit = rateLimit
-	
+
 	function eventApi:FireClient(player, ...)
 		local args = {...}
 		queueForPlayer(player, eventId, codec.pack(args), unreliable)
 	end
-	
+
 	function eventApi:FireAll(...)
 		local args = {...}
 		queueForAll(eventId, codec.pack(args), unreliable)
 	end
-	
+
 	function eventApi:FireExcept(excludedPlayer, ...)
 		local args = {...}
 		queueForExcept(excludedPlayer, eventId, codec.pack(args), unreliable)
 	end
-	
+
 	function eventApi:FireList(players, ...)
 		local args = {...}
 		queueForList(players, eventId, codec.pack(args), unreliable)
 	end
-	
+
 	function eventApi:Connect(callback)
 		return eventApi.onServerFire:connect(callback)
 	end
-	
+
 	function eventApi:Once(callback)
 		return eventApi.onServerFire:once(callback)
 	end
-	
+
 	registeredEvents[eventName] = eventApi
 	return eventApi
 end
@@ -331,14 +364,14 @@ function net.loadFunction(eventName: string): ServerFunctionApi
 	if registeredEvents[eventName] then
 		return registeredEvents[eventName]
 	end
-	
+
 	local eventId = getOrCreateEventId(eventName)
 	local eventApi = {} :: any
-	
+
 	function eventApi:OnInvoke(callback)
 		eventApi.onServerInvoke = callback
 	end
-	
+
 	function eventApi:InvokeClient(player, ...)
 		local args = {...}
 		local timeoutSeconds = 5
@@ -358,7 +391,7 @@ function net.loadFunction(eventName: string): ServerFunctionApi
 		task.cancel(timeoutHandle)
 		return success, result
 	end
-	
+
 	registeredEvents[eventName] = eventApi
 	return eventApi
 end
