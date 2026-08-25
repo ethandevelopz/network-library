@@ -158,7 +158,8 @@ local function processIncoming(packedBuffer)
 			local eventName = nameById[eventId]
 			local eventObject = eventName and registeredEvents[eventName]
 			if eventObject and eventObject.onClientFire then
-				eventObject.onClientFire:fire(codec.unpack(payload))
+				local unpackedPayload = codec.unpack(payload)
+				eventObject.onClientFire:fire(table.unpack(unpackedPayload))
 			end
 		elseif kind == kindRequest then
 			local eventId = reader:readVarUInt()
@@ -208,7 +209,7 @@ local function processIncomingUnreliable(packedBuffer)
 end
 
 export type ClientEventApi = {
-	Fire: (self: ClientEventApi, data: any) -> (),
+	FireServer: (self: ClientEventApi, data: any) -> (),
 	Connect: (self: ClientEventApi, callback: (any) -> ()) -> any,
 	Once: (self: ClientEventApi, callback: (any) -> ()) -> any,
 }
@@ -221,7 +222,7 @@ function net.loadEvent(eventName: string, options: { unreliable: boolean? }?): C
 	local unreliable = options and options.unreliable or false
 	local eventApi = {} :: any
 	eventApi.onClientFire = signalModule.new()
-	function eventApi:Fire(...)
+	function eventApi:FireServer(...)
 		local data = {...}
 		dispatchMessage(kindEvent, eventName, codec.pack(data), unreliable, nil)
 	end
