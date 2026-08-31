@@ -125,13 +125,15 @@ local function readInternedString(reader, ctx)
 	local marker = reader:readVarUInt()
 	if marker == 0 then
 		local value = reader:readString()
-		ctx.localByIndex[#ctx.localByIndex + 1] = value
+		local assignedIndex = codec._globalStringCount + 1 + ctx.localCount
+		ctx.localByIndex[assignedIndex] = value
+		ctx.localCount += 1
 		return value
 	end
 	if marker <= codec._globalStringCount then
 		return codec._globalStringByIndex[marker]
 	end
-	return ctx.localByIndex[marker - codec._globalStringCount]
+	return ctx.localByIndex[marker]
 end
 
 writeValue = function(writer, ctx, value)
@@ -181,8 +183,7 @@ writeValue = function(writer, ctx, value)
 			end
 		end
 	else
-		warn('codec unsupported type ' .. valueType .. ', encoding as nil')
-		writer:writeUInt8(tagNil)
+		error('codec unsupported type ' .. valueType, 0)
 	end
 end
 
@@ -224,12 +225,11 @@ readValue = function(reader, ctx)
 	elseif tag >= schemaBase then
 		local schema = codec._schemasById[tag - schemaBase]
 		if not schema then
-			error('codec unknown schema id ' .. (tag - schemaBase))
+			error('codec unknown schema id ' .. (tag - schemaBase), 0)
 		end
 		return schema._decodeFields(reader)
 	else
-		warn('codec unknown tag ' .. tag .. ' while decoding')
-		return nil
+		error('codec unknown tag ' .. tag .. ' while decoding', 0)
 	end
 end
 
@@ -238,9 +238,8 @@ function codec.pack(data)
 	local ctx = newWriteContext()
 	local success, result = pcall(writeValue, writer, ctx, data)
 	if not success then
-		warn('codec pack failed: ' .. tostring(result))
 		releaseWriter(writer)
-		return buffer.create(1)
+		error('codec pack failed: ' .. tostring(result), 0)
 	end
 	local packedBuffer = writer:toBuffer()
 	releaseWriter(writer)
@@ -250,6 +249,7 @@ end
 function codec.unpack(sourceBuffer)
 	local reader = acquireReader(sourceBuffer)
 	local ctx = newReadContext()
+	ctx.localCount = 0
 	local success, result = pcall(readValue, reader, ctx)
 	releaseReader(reader)
 	if success then
@@ -323,6 +323,7 @@ function codec.defineSchema(name, fields)
 
 	schema._decodeFields = function(reader)
 		local ctx = newReadContext()
+		ctx.localCount = 0
 		local result = {}
 		for _, field in ipairs(fields) do
 			result[field.name] = fieldReaders[field.type](reader, ctx)
@@ -339,13 +340,12 @@ function codec.defineSchema(name, fields)
 				fieldWriters[field.type](writer, ctx, data[field.name])
 			end
 		end)
-		
+
 		if not success then
-			warn('codec schema pack failed for "' .. name .. '": ' .. tostring(result))
 			releaseWriter(writer)
-			return buffer.create(1)
+			error('codec schema pack failed for "' .. name .. '": ' .. tostring(result), 0)
 		end
-		
+
 		local packedBuffer = writer:toBuffer()
 		releaseWriter(writer)
 		return packedBuffer
@@ -358,12 +358,12 @@ function codec.defineSchema(name, fields)
 			assert(tag == tagByte, 'codec schema mismatch decoding "' .. name .. '"')
 			return schema._decodeFields(reader)
 		end)
-		
+
 		releaseReader(reader)
 		if success then
 			return result
 		end
-		
+
 		warn('codec schema unpack failed for "' .. name .. '": ' .. tostring(result))
 		return nil
 	end

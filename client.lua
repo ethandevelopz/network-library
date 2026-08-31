@@ -19,7 +19,7 @@ local kindRequest = 1
 local kindResponse = 2
 local reliableFlushThreshold = 24
 local unreliableFlushThreshold = 32
-local maxMessagesPerPacket = 256
+local maxQueuedMessages = 512
 local masterRemote = script.Parent.__Master
 local masterUnreliableRemote = script.Parent.__MasterUnreliable
 
@@ -76,6 +76,11 @@ local function flushUnreliable()
 end
 
 local function queueReliable(message)
+	if #reliableQueue >= maxQueuedMessages then
+		warn('network reliable queue overflow, forcing flush')
+		flushReliable()
+	end
+
 	table.insert(reliableQueue, message)
 	if #reliableQueue >= reliableFlushThreshold then
 		flushReliable()
@@ -83,6 +88,11 @@ local function queueReliable(message)
 end
 
 local function queueUnreliable(message)
+	if #unreliableQueue >= maxQueuedMessages then
+		warn('network unreliable queue overflow, dropping oldest')
+		table.remove(unreliableQueue, 1)
+	end
+
 	table.insert(unreliableQueue, message)
 	if #unreliableQueue >= unreliableFlushThreshold then
 		flushUnreliable()
@@ -138,118 +148,75 @@ runService.Heartbeat:Connect(function()
 	flushUnreliable()
 end)
 
-local function handleReliableMessage(kind, reader)
-	if kind == kindEvent then
-		local eventId = reader:readVarUInt()
-		local payload = reader:readBuffer()
-		local eventName = nameById[eventId]
-		local eventObject = eventName and registeredEvents[eventName]
-		if eventObject and eventObject.onClientFire then
-			local unpackedPayload = codec.unpack(payload)
-			eventObject.onClientFire:fire(table.unpack(unpackedPayload or {}))
-		end
-	elseif kind == kindRequest then
-		local eventId = reader:readVarUInt()
-		local requestId = reader:readVarUInt()
-		local payload = reader:readBuffer()
-		local eventName = nameById[eventId]
-		local eventObject = eventName and registeredEvents[eventName]
-		if eventObject and eventObject.onClientInvoke then
-			local unpackedPayload = codec.unpack(payload)
-			task.spawn(function()
-				local returned = table.pack(pcall(eventObject.onClientInvoke, unpackedPayload))
-				local success = returned[1]
-				local results = table.pack(table.unpack(returned, 2, returned.n))
-				queueReliable({ kind = kindResponse, requestId = requestId, success = success, payload = codec.pack(results) })
-				flushReliable()
-			end)
-		end
-	elseif kind == kindResponse then
-		local requestId = reader:readVarUInt()
-		local success = reader:readUInt8() == 1
-		local payload = reader:readBuffer()
-		local thread = pendingRequests[requestId]
-		if thread then
-			pendingRequests[requestId] = nil
-			local unpackedPayload = codec.unpack(payload)
-			task.spawn(thread, success, table.unpack(unpackedPayload or {}))
-		end
-	else
-		error('unknown message kind ' .. tostring(kind))
-	end
-end
-
 local function processIncoming(packedBuffer)
-	if typeof(packedBuffer) ~= 'buffer' then
-		return
+	local reader = bufferReader.new(packedBuffer)
+	statsReceived.bytes += buffer.len(packedBuffer)
+	local idSyncCount = reader:readVarUInt()
+	for _ = 1, idSyncCount do
+		local eventId = reader:readVarUInt()
+		local eventName = reader:readString()
+		nameById[eventId] = eventName
+		idByName[eventName] = eventId
 	end
 
-	local success, err = pcall(function()
-		local reader = bufferReader.new(packedBuffer)
-		statsReceived.bytes += buffer.len(packedBuffer)
-		local idSyncCount = reader:readVarUInt()
-
-		if idSyncCount > maxMessagesPerPacket then
-			error('idSyncCount ' .. idSyncCount .. ' exceeds max ' .. maxMessagesPerPacket)
-		end
-
-		for _ = 1, idSyncCount do
+	local messageCount = reader:readVarUInt()
+	statsReceived.messages += messageCount
+	for _ = 1, messageCount do
+		local kind = reader:readUInt8()
+		if kind == kindEvent then
 			local eventId = reader:readVarUInt()
-			local eventName = reader:readString()
-			nameById[eventId] = eventName
-			idByName[eventName] = eventId
+			local payload = reader:readBuffer()
+			local eventName = nameById[eventId]
+			local eventObject = eventName and registeredEvents[eventName]
+			if eventObject and eventObject.onClientFire then
+				local unpackedPayload = codec.unpack(payload)
+				eventObject.onClientFire:fire(table.unpack(unpackedPayload))
+			end
+		elseif kind == kindRequest then
+			local eventId = reader:readVarUInt()
+			local requestId = reader:readVarUInt()
+			local payload = reader:readBuffer()
+			local eventName = nameById[eventId]
+			local eventObject = eventName and registeredEvents[eventName]
+			if eventObject and eventObject.onClientInvoke then
+				task.spawn(function()
+					local success, result = pcall(eventObject.onClientInvoke, codec.unpack(payload))
+					queueReliable({ kind = kindResponse, requestId = requestId, success = success, payload = codec.pack(result) })
+					flushReliable()
+				end)
+			end
+		elseif kind == kindResponse then
+			local requestId = reader:readVarUInt()
+			local success = reader:readUInt8() == 1
+			local payload = reader:readBuffer()
+			local thread = pendingRequests[requestId]
+			if thread then
+				pendingRequests[requestId] = nil
+				local unpackedPayload = codec.unpack(payload)
+				task.spawn(thread, success, table.unpack(unpackedPayload))
+			end
 		end
-
-		local messageCount = reader:readVarUInt()
-		if messageCount > maxMessagesPerPacket then
-			error('messageCount ' .. messageCount .. ' exceeds max ' .. maxMessagesPerPacket)
-		end
-
-		statsReceived.messages += messageCount
-		for _ = 1, messageCount do
-			local kind = reader:readUInt8()
-			handleReliableMessage(kind, reader)
-		end
-	end)
-
-	if not success then
-		warn('processIncoming failed: ' .. tostring(err))
 	end
 end
 
 local function processIncomingUnreliable(packedBuffer)
-	if typeof(packedBuffer) ~= 'buffer' then
-		return
-	end
+	local reader = bufferReader.new(packedBuffer)
+	statsReceived.bytes += buffer.len(packedBuffer)
+	local messageCount = reader:readVarUInt()
+	statsReceived.messages += messageCount
 
-	local success, err = pcall(function()
-		local reader = bufferReader.new(packedBuffer)
-		statsReceived.bytes += buffer.len(packedBuffer)
-		local messageCount = reader:readVarUInt()
-
-		if messageCount > maxMessagesPerPacket then
-			error('messageCount ' .. messageCount .. ' exceeds max ' .. maxMessagesPerPacket)
-		end
-
-		statsReceived.messages += messageCount
-
-		for _ = 1, messageCount do
-			local kind = reader:readUInt8()
-			local eventId = reader:readVarUInt()
-			local payload = reader:readBuffer()
-			if kind == kindEvent then
-				local eventName = nameById[eventId]
-				local eventObject = eventName and registeredEvents[eventName]
-				if eventObject and eventObject.onClientFire then
-					local unpackedPayload = codec.unpack(payload)
-					eventObject.onClientFire:fire(table.unpack(unpackedPayload or {}))
-				end
+	for _ = 1, messageCount do
+		local kind = reader:readUInt8()
+		local eventId = reader:readVarUInt()
+		local payload = reader:readBuffer()
+		if kind == kindEvent then
+			local eventName = nameById[eventId]
+			local eventObject = eventName and registeredEvents[eventName]
+			if eventObject and eventObject.onClientFire then
+				local unpackedPayload = codec.unpack(payload)
+				eventObject.onClientFire:fire(table.unpack(unpackedPayload))
 			end
 		end
-	end)
-
-	if not success then
-		warn('processIncomingUnreliable failed: ' .. tostring(err))
 	end
 end
 
@@ -309,7 +276,7 @@ function net.loadFunction(eventName: string): ClientFunctionApi
 		dispatchMessage(kindRequest, eventName, codec.pack(data), false, requestId)
 		resolvePending()
 		flushReliable()
-		local timeoutHandle = task.delay(timeoutSeconds or 10, function()
+		local timeoutHandle = task.delay(timeoutSeconds, function()
 			if pendingRequests[requestId] then
 				pendingRequests[requestId] = nil
 				task.spawn(thread, false, 'timeout')
