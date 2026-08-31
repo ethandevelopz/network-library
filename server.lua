@@ -1,5 +1,5 @@
 local runService = game:GetService('RunService')
-local playersService = game:GetService('Players')
+local players = game:GetService('Players')
 local network = game.ReplicatedStorage.Network
 local modules = network.Modules
 local codec = require(modules.Codec)
@@ -38,12 +38,12 @@ local function initializePlayerState(player)
 	unsyncedIdsByPlayer[player] = pending
 end
 
-for _, player in ipairs(playersService:GetPlayers()) do
+for _, player in ipairs(players:GetPlayers()) do
 	initializePlayerState(player)
 end
 
-playersService.PlayerAdded:Connect(initializePlayerState)
-playersService.PlayerRemoving:Connect(function(player)
+players.PlayerAdded:Connect(initializePlayerState)
+players.PlayerRemoving:Connect(function(player)
 	reliableQueueByPlayer[player] = nil
 	unreliableQueueByPlayer[player] = nil
 	unsyncedIdsByPlayer[player] = nil
@@ -60,7 +60,7 @@ local function getOrCreateEventId(eventName)
 	nextEventId += 1
 	idByName[eventName] = eventId
 	nameById[eventId] = eventName
-	for _, player in ipairs(playersService:GetPlayers()) do
+	for _, player in ipairs(players:GetPlayers()) do
 		if unsyncedIdsByPlayer[player] then
 			table.insert(unsyncedIdsByPlayer[player], eventId)
 		end
@@ -182,13 +182,13 @@ local function queueForPlayer(player, eventId, payload, unreliable)
 end
 
 local function queueForAll(eventId, payload, unreliable)
-	for _, player in ipairs(playersService:GetPlayers()) do
+	for _, player in ipairs(players:GetPlayers()) do
 		queueForPlayer(player, eventId, payload, unreliable)
 	end
 end
 
 local function queueForExcept(excludedPlayer, eventId, payload, unreliable)
-	for _, player in ipairs(playersService:GetPlayers()) do
+	for _, player in ipairs(players:GetPlayers()) do
 		if player ~= excludedPlayer then
 			queueForPlayer(player, eventId, payload, unreliable)
 		end
@@ -202,7 +202,7 @@ local function queueForList(players, eventId, payload, unreliable)
 end
 
 runService.Heartbeat:Connect(function()
-	for _, player in ipairs(playersService:GetPlayers()) do
+	for _, player in ipairs(players:GetPlayers()) do
 		flushPlayerReliable(player)
 		flushPlayerUnreliable(player)
 	end
