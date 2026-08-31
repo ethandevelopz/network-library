@@ -24,7 +24,7 @@ local kindRequest = 1
 local kindResponse = 2
 local reliableFlushThreshold = 24
 local unreliableFlushThreshold = 32
-local maxMessagesPerPacket = 256
+local maxQueuedPerPlayer = 512
 local masterRemote = network.__Master
 local masterUnreliableRemote = network.__MasterUnreliable
 
@@ -143,6 +143,11 @@ local function queueReliable(player, message)
 		queue = reliableQueueByPlayer[player]
 	end
 
+	if #queue >= maxQueuedPerPlayer then
+		warn('network reliable queue overflow for ' .. player.Name .. ', forcing flush')
+		flushPlayerReliable(player)
+	end
+
 	table.insert(queue, message)
 	if #queue >= reliableFlushThreshold then
 		flushPlayerReliable(player)
@@ -154,6 +159,11 @@ local function queueUnreliable(player, message)
 	if not queue then
 		initializePlayerState(player)
 		queue = unreliableQueueByPlayer[player]
+	end
+
+	if #queue >= maxQueuedPerPlayer then
+		warn('network unreliable queue overflow for ' .. player.Name .. ', dropping oldest')
+		table.remove(queue, 1)
 	end
 
 	table.insert(queue, message)
@@ -212,93 +222,67 @@ local function checkRateLimit(eventName, player, maxPerSecond)
 	local state = perEvent[player]
 	local now = os.clock()
 	if not state or now - state.windowStart >= 1 then
-		state = { count = 0, windowStart = now }
+		state = { count = 0, windowStart = now, violations = state and state.violations or 0 }
 		perEvent[player] = state
 	end
 
 	state.count += 1
-	return state.count <= maxPerSecond
+	if state.count > maxPerSecond then
+		state.violations += 1
+		if state.violations >= 10 then
+			warn('network rate limit repeatedly exceeded by ' .. player.Name .. ' on "' .. eventName .. '"')
+		end
+		return false
+	end
+
+	return true
 end
 
-local function handleMessage(player, kind, reader)
-	if kind == kindEvent then
-		local eventId = reader:readVarUInt()
-		local payload = reader:readBuffer()
-		local eventName = nameById[eventId]
-		local eventObject = eventName and registeredEvents[eventName]
-		if eventObject and eventObject.onServerFire then
-			if checkRateLimit(eventName, player, eventObject.rateLimit) then
-				local unpackedPayload = codec.unpack(payload)
-				eventObject.onServerFire:fire(player, table.unpack(unpackedPayload or {}))
+local function processIncoming(player, packedBuffer)
+	local reader = bufferReader.new(packedBuffer)
+	statsReceived.bytes += buffer.len(packedBuffer)
+	local messageCount = reader:readVarUInt()
+	statsReceived.messages += messageCount
+	for _ = 1, messageCount do
+		local kind = reader:readUInt8()
+		if kind == kindEvent then
+			local eventId = reader:readVarUInt()
+			local payload = reader:readBuffer()
+			local eventName = nameById[eventId]
+			local eventObject = eventName and registeredEvents[eventName]
+			if eventObject and eventObject.onServerFire then
+				if checkRateLimit(eventName, player, eventObject.rateLimit) then
+					local unpackedPayload = codec.unpack(payload)
+					eventObject.onServerFire:fire(player, table.unpack(unpackedPayload))
+				end
 			end
-		end
-	elseif kind == kindRequest then
-		local eventId = reader:readVarUInt()
-		local requestId = reader:readVarUInt()
-		local payload = reader:readBuffer()
-		local eventName = nameById[eventId]
-		local eventObject = eventName and registeredEvents[eventName]
-		if eventObject and eventObject.onServerInvoke then
-			if checkRateLimit(eventName, player, eventObject.rateLimit) then
-				local unpackedPayload = codec.unpack(payload)
+		elseif kind == kindRequest then
+			local eventId = reader:readVarUInt()
+			local requestId = reader:readVarUInt()
+			local payload = reader:readBuffer()
+			local eventName = nameById[eventId]
+			local eventObject = eventName and registeredEvents[eventName]
+			if eventObject and eventObject.onServerInvoke then
 				task.spawn(function()
-					local returned = table.pack(pcall(eventObject.onServerInvoke, player, unpackedPayload))
-					local success = returned[1]
-					local results = table.pack(table.unpack(returned, 2, returned.n))
+					local success, result = pcall(eventObject.onServerInvoke, player, codec.unpack(payload))
 					queueReliable(player, {
 						kind = kindResponse,
 						requestId = requestId,
 						success = success,
-						payload = codec.pack(results),
+						payload = codec.pack(result),
 					})
 				end)
-			else
-				queueReliable(player, {
-					kind = kindResponse,
-					requestId = requestId,
-					success = false,
-					payload = codec.pack({ 'rate_limited' }),
-				})
+			end
+		elseif kind == kindResponse then
+			local requestId = reader:readVarUInt()
+			local success = reader:readUInt8() == 1
+			local payload = reader:readBuffer()
+			local thread = pendingRequests[requestId]
+			if thread then
+				pendingRequests[requestId] = nil
+				task.spawn(thread, success, codec.unpack(payload))
 			end
 		end
-	elseif kind == kindResponse then
-		local requestId = reader:readVarUInt()
-		local success = reader:readUInt8() == 1
-		local payload = reader:readBuffer()
-		local thread = pendingRequests[requestId]
-		if thread then
-			pendingRequests[requestId] = nil
-			local unpackedPayload = codec.unpack(payload)
-			task.spawn(thread, success, table.unpack(unpackedPayload or {}))
-		end
-	else
-		error('unknown message kind ' .. tostring(kind))
-	end
-end
-
-local function processIncoming(player, packedBuffer)
-	if typeof(packedBuffer) ~= 'buffer' then
-		return
-	end
-
-	local success, err = pcall(function()
-		local reader = bufferReader.new(packedBuffer)
-		statsReceived.bytes += buffer.len(packedBuffer)
-		local messageCount = reader:readVarUInt()
-
-		if messageCount > maxMessagesPerPacket then
-			error('messageCount ' .. messageCount .. ' exceeds max ' .. maxMessagesPerPacket)
-		end
-
-		statsReceived.messages += messageCount
-		for _ = 1, messageCount do
-			local kind = reader:readUInt8()
-			handleMessage(player, kind, reader)
-		end
-	end)
-
-	if not success then
-		warn('processIncoming failed for player ' .. player.Name .. ': ' .. tostring(err))
 	end
 end
 
@@ -381,7 +365,7 @@ function net.loadFunction(eventName: string): ServerFunctionApi
 		pendingRequests[requestId] = thread
 		queueReliable(player, { kind = kindRequest, id = eventId, requestId = requestId, payload = codec.pack(args) })
 		flushPlayerReliable(player)
-		local timeoutHandle = task.delay(timeoutSeconds or 10, function()
+		local timeoutHandle = task.delay(timeoutSeconds, function()
 			if pendingRequests[requestId] then
 				pendingRequests[requestId] = nil
 				task.spawn(thread, false, 'timeout')
