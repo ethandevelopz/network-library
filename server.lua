@@ -35,6 +35,7 @@ local function initializePlayerState(player)
 	for eventId in pairs(nameById) do
 		table.insert(pending, eventId)
 	end
+	
 	unsyncedIdsByPlayer[player] = pending
 end
 

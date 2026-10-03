@@ -1,33 +1,13 @@
 local bufferWriter = require(script.Parent.Writer)
 local bufferReader = require(script.Parent.Reader)
+local enums = require(script.Parent.Enums)
 local codec = {}
-local tagNil = 0
-local tagFalse = 1
-local tagTrue = 2
-local tagInteger = 3
-local tagFloat = 4
-local tagString = 5
-local tagVector3 = 6
-local tagArray = 7
-local tagDictionary = 8
-local tagBuffer = 9
-local tagExtended = 10
-local extInstance = 1
-local extPlayer = 2
-local extCFrame = 3
-local extColor3 = 4
-local extBrickColor = 5
-local extUDim = 6
-local extUDim2 = 7
-local extVector2 = 8
-local extVector2int16 = 9
-local extVector3int16 = 10
-local extEnumItem = 11
-local extNumberRange = 12
-local extRect = 13
-local extDateTime = 14
-local extColorSequence = 15
-local extNumberSequence = 16
+local tag = enums.tag
+local ext = enums.ext
+local tagNil, tagFalse, tagTrue, tagInteger, tagFloat, tagString, tagVector3, tagArray, tagDictionary, tagBuffer, tagExtended =
+	tag.Nil, tag.False, tag.True, tag.Integer, tag.Float, tag.String, tag.Vector3, tag.Array, tag.Dictionary, tag.Buffer, tag.Extended
+local extInstance, extPlayer, extCFrame, extColor3, extBrickColor, extUDim, extUDim2, extVector2, extVector2int16, extVector3int16, extEnumItem, extNumberRange, extRect, extDateTime, extColorSequence, extNumberSequence =
+	ext.Instance, ext.Player, ext.CFrame, ext.Color3, ext.BrickColor, ext.UDim, ext.UDim2, ext.Vector2, ext.Vector2int16, ext.Vector3int16, ext.EnumItem, ext.NumberRange, ext.Rect, ext.DateTime, ext.ColorSequence, ext.NumberSequence
 local players = game:GetService('Players')
 local smallIntBase = 11
 local schemaBase = 224
@@ -211,7 +191,7 @@ local function cframeToQuaternion(cframe)
 	end
 end
 
-writeValue = function(writer, ctx, value)
+function writeValue(writer, ctx, value)
 	local valueType = typeof(value)
 	if value == nil then
 		writer:writeUInt8(tagNil)
@@ -363,138 +343,164 @@ writeValue = function(writer, ctx, value)
 	end
 end
 
-readValue = function(reader, ctx)
-	local tag = reader:readUInt8()
-	if tag >= smallIntBase and tag < schemaBase then
-		return zigzagDecode(tag - smallIntBase)
-	elseif tag == tagNil then
+local extReaders = {
+	[extInstance] = function(reader, ctx)
+		return readInstancePath(reader, ctx)
+	end,
+	[extPlayer] = function(reader, ctx)
+		return players:GetPlayerByUserId(reader:readVarUInt())
+	end,
+	[extCFrame] = function(reader, ctx)
+		local px, py, pz = reader:readFloat32(), reader:readFloat32(), reader:readFloat32()
+		local qx, qy, qz, qw = reader:readFloat32(), reader:readFloat32(), reader:readFloat32(), reader:readFloat32()
+		return CFrame.new(px, py, pz, qx, qy, qz, qw)
+	end,
+	[extColor3] = function(reader, ctx)
+		return Color3.fromRGB(reader:readUInt8(), reader:readUInt8(), reader:readUInt8())
+	end,
+	[extBrickColor] = function(reader, ctx)
+		return BrickColor.new(reader:readVarUInt())
+	end,
+	[extUDim] = function(reader, ctx)
+		return readUDimValue(reader)
+	end,
+	[extUDim2] = function(reader, ctx)
+		local x = readUDimValue(reader)
+		local y = readUDimValue(reader)
+		return UDim2.new(x.Scale, x.Offset, y.Scale, y.Offset)
+	end,
+	[extVector2] = function(reader, ctx)
+		return Vector2.new(reader:readFloat32(), reader:readFloat32())
+	end,
+	[extVector2int16] = function(reader, ctx)
+		return Vector2int16.new(reader:readInt32(), reader:readInt32())
+	end,
+	[extVector3int16] = function(reader, ctx)
+		return Vector3int16.new(reader:readInt32(), reader:readInt32(), reader:readInt32())
+	end,
+	[extEnumItem] = function(reader, ctx)
+		local enumTypeName = readInternedString(reader, ctx)
+		local itemName = readInternedString(reader, ctx)
+		return Enum[enumTypeName][itemName]
+	end,
+	[extNumberRange] = function(reader, ctx)
+		return NumberRange.new(reader:readFloat32(), reader:readFloat32())
+	end,
+	[extRect] = function(reader, ctx)
+		local minX, minY, maxX, maxY = reader:readFloat32(), reader:readFloat32(), reader:readFloat32(), reader:readFloat32()
+		return Rect.new(minX, minY, maxX, maxY)
+	end,
+	[extDateTime] = function(reader, ctx)
+		return DateTime.fromUnixTimestampMillis(reader:readVarUInt())
+	end,
+	[extColorSequence] = function(reader, ctx)
+		local keypointCount = reader:readVarUInt()
+		local keypoints = table.create(keypointCount)
+		for index = 1, keypointCount do
+			local time = reader:readFloat32()
+			local color = Color3.fromRGB(reader:readUInt8(), reader:readUInt8(), reader:readUInt8())
+			keypoints[index] = ColorSequenceKeypoint.new(time, color)
+		end
+		return ColorSequence.new(keypoints)
+	end,
+	[extNumberSequence] = function(reader, ctx)
+		local keypointCount = reader:readVarUInt()
+		local keypoints = table.create(keypointCount)
+		for index = 1, keypointCount do
+			local time = reader:readFloat32()
+			local value = reader:readFloat32()
+			local envelope = reader:readFloat32()
+			keypoints[index] = NumberSequenceKeypoint.new(time, value, envelope)
+		end
+		return NumberSequence.new(keypoints)
+	end,
+}
+
+local tagReaders = {
+	[tagNil] = function(reader, ctx)
 		return nil
-	elseif tag == tagFalse then
+	end,
+	[tagFalse] = function(reader, ctx)
 		return false
-	elseif tag == tagTrue then
+	end,
+	[tagTrue] = function(reader, ctx)
 		return true
-	elseif tag == tagInteger then
+	end,
+	[tagInteger] = function(reader, ctx)
 		return zigzagDecode(reader:readVarUInt())
-	elseif tag == tagFloat then
+	end,
+	[tagFloat] = function(reader, ctx)
 		return reader:readFloat64()
-	elseif tag == tagString then
+	end,
+	[tagString] = function(reader, ctx)
 		return readInternedString(reader, ctx)
-	elseif tag == tagVector3 then
+	end,
+	[tagVector3] = function(reader, ctx)
 		return Vector3.new(reader:readFloat32(), reader:readFloat32(), reader:readFloat32())
-	elseif tag == tagBuffer then
+	end,
+	[tagBuffer] = function(reader, ctx)
 		return reader:readBuffer()
-	elseif tag == tagArray then
+	end,
+	[tagArray] = function(reader, ctx)
 		local elementCount = reader:readVarUInt()
 		local result = table.create(elementCount)
-		
 		for index = 1, elementCount do
 			result[index] = readValue(reader, ctx)
 		end
-		
 		return result
-	elseif tag == tagDictionary then
+	end,
+	[tagDictionary] = function(reader, ctx)
 		local elementCount = reader:readVarUInt()
 		local result = {}
-		
 		for _ = 1, elementCount do
 			local key = readInternedString(reader, ctx)
 			result[key] = readValue(reader, ctx)
 		end
-		
 		return result
-	elseif tag == tagExtended then
+	end,
+	[tagExtended] = function(reader, ctx)
 		local extTag = reader:readUInt8()
-		
-		if extTag == extInstance then
-			return readInstancePath(reader, ctx)
-		elseif extTag == extPlayer then
-			return players:GetPlayerByUserId(reader:readVarUInt())
-		elseif extTag == extCFrame then
-			local px, py, pz = reader:readFloat32(), reader:readFloat32(), reader:readFloat32()
-			local qx, qy, qz, qw = reader:readFloat32(), reader:readFloat32(), reader:readFloat32(), reader:readFloat32()
-			
-			return CFrame.new(px, py, pz, qx, qy, qz, qw)
-		elseif extTag == extColor3 then
-			return Color3.fromRGB(reader:readUInt8(), reader:readUInt8(), reader:readUInt8())
-		elseif extTag == extBrickColor then
-			return BrickColor.new(reader:readVarUInt())
-		elseif extTag == extUDim then
-			return readUDimValue(reader)
-		elseif extTag == extUDim2 then
-			local x = readUDimValue(reader)
-			local y = readUDimValue(reader)
-			
-			return UDim2.new(x.Scale, x.Offset, y.Scale, y.Offset)
-		elseif extTag == extVector2 then
-			return Vector2.new(reader:readFloat32(), reader:readFloat32())
-		elseif extTag == extVector2int16 then
-			return Vector2int16.new(reader:readInt32(), reader:readInt32())
-		elseif extTag == extVector3int16 then
-			return Vector3int16.new(reader:readInt32(), reader:readInt32(), reader:readInt32())
-		elseif extTag == extEnumItem then
-			local enumTypeName = readInternedString(reader, ctx)
-			local itemName = readInternedString(reader, ctx)
-			
-			return Enum[enumTypeName][itemName]
-		elseif extTag == extNumberRange then
-			return NumberRange.new(reader:readFloat32(), reader:readFloat32())
-		elseif extTag == extRect then
-			local minX, minY, maxX, maxY = reader:readFloat32(), reader:readFloat32(), reader:readFloat32(), reader:readFloat32()
-			
-			return Rect.new(minX, minY, maxX, maxY)
-		elseif extTag == extDateTime then
-			return DateTime.fromUnixTimestampMillis(reader:readVarUInt())
-		elseif extTag == extColorSequence then
-			local keypointCount = reader:readVarUInt()
-			local keypoints = table.create(keypointCount)
-			
-			for index = 1, keypointCount do
-				local time = reader:readFloat32()
-				local color = Color3.fromRGB(reader:readUInt8(), reader:readUInt8(), reader:readUInt8())
-				keypoints[index] = ColorSequenceKeypoint.new(time, color)
-			end
-			
-			return ColorSequence.new(keypoints)
-		elseif extTag == extNumberSequence then
-			local keypointCount = reader:readVarUInt()
-			local keypoints = table.create(keypointCount)
-			
-			for index = 1, keypointCount do
-				local time = reader:readFloat32()
-				local value = reader:readFloat32()
-				local envelope = reader:readFloat32()
-				keypoints[index] = NumberSequenceKeypoint.new(time, value, envelope)
-			end
-			
-			return NumberSequence.new(keypoints)
-		else
-			error('codec unknown extended tag ' .. extTag .. ' while decoding', 0)
+		local extReader = extReaders[extTag]
+		if not extReader then
+		error('codec unknown extended tag ' .. extTag .. ' while decoding', 0)
 		end
-	elseif tag >= schemaBase then
-		local schema = codec._schemasById[tag - schemaBase]
-		
-		if not schema then
-			error('codec unknown schema id ' .. (tag - schemaBase), 0)
-		end
-		
-		return schema._decodeFields(reader)
-	else
-		error('codec unknown tag ' .. tag .. ' while decoding', 0)
+		return extReader(reader, ctx)
+	end,
+}
+
+function readValue(reader, ctx)
+	local tag = reader:readUInt8()
+	if tag >= smallIntBase and tag < schemaBase then
+		return zigzagDecode(tag - smallIntBase)
 	end
+
+	local tagReader = tagReaders[tag]
+	if tagReader then
+		return tagReader(reader, ctx)
+	end
+
+	if tag >= schemaBase then
+		local schema = codec._schemasById[tag - schemaBase]
+		if not schema then
+		error('codec unknown schema id ' .. (tag - schemaBase), 0)
+		end
+		return schema._decodeFields(reader)
+	end
+
+	error('codec unknown tag ' .. tag .. ' while decoding', 0)
 end
 
 function codec.pack(data)
 	local writer = acquireWriter()
 	local ctx = newWriteContext()
 	local success, result = pcall(writeValue, writer, ctx, data)
-	
+	local packedBuffer = success and writer:toBuffer() or nil
+	releaseWriter(writer)
+
 	if not success then
-		releaseWriter(writer)
 		error('codec pack failed: ' .. tostring(result), 0)
 	end
-	
-	local packedBuffer = writer:toBuffer()
-	releaseWriter(writer)
+
 	return packedBuffer
 end
 
@@ -797,13 +803,13 @@ function codec.defineSchema(name, fields)
 			end
 		end)
 
+		local packedBuffer = success and writer:toBuffer() or nil
+		releaseWriter(writer)
+
 		if not success then
-			releaseWriter(writer)
 			error('codec schema pack failed for "' .. name .. '": ' .. tostring(result), 0)
 		end
 
-		local packedBuffer = writer:toBuffer()
-		releaseWriter(writer)
 		return packedBuffer
 	end
 
