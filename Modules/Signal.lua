@@ -1,28 +1,29 @@
 local signal = {}
 signal.__index = signal
 
+local connectionMeta = {}
+connectionMeta.__index = connectionMeta
+
+function connectionMeta:disconnect()
+	if not self.connected then
+		return
+	end
+	self.connected = false
+	for index, listener in ipairs(self.owner.listeners) do
+		if listener == self then
+			table.remove(self.owner.listeners, index)
+			break
+		end
+	end
+end
+connectionMeta.Disconnect = connectionMeta.disconnect
+
 function signal.new()
 	return setmetatable({ listeners = {} }, signal)
 end
 
 function signal:connect(callback)
-	local connection = {}
-	connection.callback = callback
-	connection.connected = true
-	connection.owner = self
-	function connection:disconnect()
-		if not self.connected then
-			return
-		end
-		self.connected = false
-		for index, listener in ipairs(self.owner.listeners) do
-			if listener == self then
-				table.remove(self.owner.listeners, index)
-				break
-			end
-		end
-	end
-	connection.Disconnect = connection.disconnect
+	local connection = setmetatable({ callback = callback, connected = true, owner = self }, connectionMeta)
 	table.insert(self.listeners, connection)
 	return connection
 end
