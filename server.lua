@@ -1,395 +1,555 @@
-local runService = game:GetService('RunService')
 local players = game:GetService('Players')
-local network = game.ReplicatedStorage.Network
-local modules = network.Modules
-local codec = require(modules.Codec)
-local bufferWriter = require(modules.Writer)
-local bufferReader = require(modules.Reader)
-local signalModule = require(modules.Signal)
+local runService = game:GetService('RunService')
+local replicatedStorage = game:GetService('ReplicatedStorage')
+local network = replicatedStorage:WaitForChild('Network')
+local modules = network:WaitForChild('Modules')
+local codec = require(modules:WaitForChild('Codec'))
+local packet = require(modules:WaitForChild('Packet'))
+local signal = require(modules:WaitForChild('Signal'))
+local idl = require(modules:WaitForChild('Idl'))
+local enums = require(modules:WaitForChild('Enums'))
+local masterRemote = network:WaitForChild('__Master')
+local masterUnreliableRemote = network:WaitForChild('__MasterUnreliable')
 local net = {}
-local registeredEvents = {}
-local idByName = {}
-local nameById = {}
-local nextEventId = 1
-local nextRequestId = 1
+local entriesByName = {}
+local entriesById = {}
+local definitions = {}
+local aliases = {}
+local playerStates = {}
+local dirtyStates = {}
 local pendingRequests = {}
-local reliableQueueByPlayer = {}
-local unreliableQueueByPlayer = {}
-local unsyncedIdsByPlayer = {}
-local rateLimitState = {}
-local statsSent = { bytes = 0, messages = 0 }
-local statsReceived = { bytes = 0, messages = 0 }
-local kindEvent = 0
-local kindRequest = 1
-local kindResponse = 2
-local reliableFlushThreshold = 24
-local unreliableFlushThreshold = 32
-local maxQueuedPerPlayer = 512
-local masterRemote = network.__Master
-local masterUnreliableRemote = network.__MasterUnreliable
+local emptyRefs = {}
+local stats = { sentBytes = 0, sentMessages = 0, receivedBytes = 0, receivedMessages = 0, droppedMessages = 0 }
+local eventMeta = {}
+local functionMeta = {}
+local kindEvent, kindRequest, kindResponse, kindSync = enums.kind.Event, enums.kind.Request, enums.kind.Response, enums.kind.Sync
+local dirtyCount = 0
+local nextRequestId = 0
+local defaultRateLimit = 5
+local defaultTimeout = 5
+local maxIncomingBytes = 65536
+local maxIncomingRefs = 256
+local maxBatchRefs = 250
+local unreliableBudget = 800
+local maxInflightRequests = 16
+local maxWaitingRequests = 64
+local maxRequestId = 1048575
+local strikeWarnThreshold = 10
+local genericError = 'server error'
+eventMeta.__index = eventMeta
+functionMeta.__index = functionMeta
+net.Violation = signal.new()
+net.codec = codec
+net.types = codec.types
 
-local function initializePlayerState(player)
-	reliableQueueByPlayer[player] = {}
-	unreliableQueueByPlayer[player] = {}
-	local pending = {}
-	for eventId in pairs(nameById) do
-		table.insert(pending, eventId)
+export type ServerEventApi = {
+	Name: string,
+	FireClient: (self: ServerEventApi, player: Player, ...any) -> (),
+	FireAll: (self: ServerEventApi, ...any) -> (),
+	FireExcept: (self: ServerEventApi, excludedPlayer: Player, ...any) -> (),
+	FireList: (self: ServerEventApi, players: { Player }, ...any) -> (),
+	Connect: (self: ServerEventApi, callback: (Player, ...any) -> ()) -> any,
+	Once: (self: ServerEventApi, callback: (Player, ...any) -> ()) -> any,
+	Wait: (self: ServerEventApi) -> (Player, ...any),
+}
+
+export type ServerFunctionApi = {
+	Name: string,
+	OnInvoke: (self: ServerFunctionApi, callback: (Player, ...any) -> ...any) -> (),
+	InvokeClient: (self: ServerFunctionApi, player: Player, ...any) -> (boolean, ...any),
+}
+
+local function markDirty(state)
+	if not state.dirty then
+		state.dirty = true
+		dirtyCount += 1
+		dirtyStates[dirtyCount] = state
 	end
-	
-	unsyncedIdsByPlayer[player] = pending
 end
 
-for _, player in ipairs(players:GetPlayers()) do
-	initializePlayerState(player)
+local function sendBatch(player, remote, batch)
+	local data, refs, refCount, messages = packet.take(batch)
+	stats.sentBytes += buffer.len(data)
+	stats.sentMessages += messages
+	if refCount > 0 then
+		remote:FireClient(player, data, table.unpack(refs, 1, refCount))
+	else
+		remote:FireClient(player, data)
+	end
 end
 
-players.PlayerAdded:Connect(initializePlayerState)
-players.PlayerRemoving:Connect(function(player)
-	reliableQueueByPlayer[player] = nil
-	unreliableQueueByPlayer[player] = nil
-	unsyncedIdsByPlayer[player] = nil
-end)
-
-local function getOrCreateEventId(eventName)
-	local eventId = idByName[eventName]
-
-	if eventId then
-		return eventId
+local function flushState(state)
+	state.dirty = false
+	if state.reliable.length > 0 then
+		sendBatch(state.player, masterRemote, state.reliable)
 	end
 
-	eventId = nextEventId
-	nextEventId += 1
-	idByName[eventName] = eventId
-	nameById[eventId] = eventName
-	for _, player in ipairs(players:GetPlayers()) do
-		if unsyncedIdsByPlayer[player] then
-			table.insert(unsyncedIdsByPlayer[player], eventId)
+	if state.unreliable.length > 0 then
+		sendBatch(state.player, masterUnreliableRemote, state.unreliable)
+	end
+end
+
+local function appendMessage(state, entry, kind, id, extra, length, refCount)
+	local payload, refs = codec.getScratch()
+	local batch, remote = state.reliable, masterRemote
+	if entry and entry.unreliable and kind == kindEvent then
+		local frame = packet.frameSize(length, refCount)
+		if frame <= unreliableBudget then
+			batch, remote = state.unreliable, masterUnreliableRemote
+			if batch.length > 0 and batch.length + batch.refCount * 8 + frame > unreliableBudget then
+				sendBatch(state.player, remote, batch)
+			end
+		elseif not entry.oversizeWarned then
+			entry.oversizeWarned = true
+			warn(('network event %s is too large for an unreliable remote (%d bytes), sending it reliably'):format(entry.name, length))
 		end
 	end
 
-	return eventId
-end
-
-local function writeMessageWithId(writer, message)
-	writer:writeUInt8(message.kind)
-
-	if message.kind == kindResponse then
-		writer:writeVarUInt(message.requestId)
-		writer:writeUInt8(message.success and 1 or 0)
-		writer:writeBuffer(message.payload)
-	elseif message.kind == kindRequest then
-		writer:writeVarUInt(message.id)
-		writer:writeVarUInt(message.requestId)
-		writer:writeBuffer(message.payload)
-	else
-		writer:writeVarUInt(message.id)
-		writer:writeBuffer(message.payload)
+	if batch.length > 0 and batch.refCount + refCount > maxBatchRefs then
+		sendBatch(state.player, remote, batch)
 	end
+
+	packet.append(batch, kind, id, extra, payload, length, refs, refCount)
+	markDirty(state)
 end
 
-local function flushPlayerReliable(player)
-	local queue = reliableQueueByPlayer[player]
-	local pendingIds = unsyncedIdsByPlayer[player]
-	if not queue or not pendingIds then
+local function appendSync(state, entry)
+	local length = codec.encodeString(entry.name)
+	appendMessage(state, nil, kindSync, entry.id, 0, length, 0)
+end
+
+local function resolveRequest(requestId, request, ...)
+	if pendingRequests[requestId] ~= request then
 		return
 	end
 
-	if #queue == 0 and #pendingIds == 0 then
-		return
+	pendingRequests[requestId] = nil
+	local timeout = request.timeout
+	request.timeout = nil
+	if timeout then
+		task.cancel(timeout)
 	end
 
-	local writer = bufferWriter.new()
-	writer:writeVarUInt(#pendingIds)
-	for _, eventId in ipairs(pendingIds) do
-		writer:writeVarUInt(eventId)
-		writer:writeString(nameById[eventId])
-	end
-
-	table.clear(pendingIds)
-	writer:writeVarUInt(#queue)
-	for _, message in ipairs(queue) do
-		writeMessageWithId(writer, message)
-	end
-
-	statsSent.messages += #queue
-	table.clear(queue)
-	local outgoingBuffer = writer:toBuffer()
-	statsSent.bytes += buffer.len(outgoingBuffer)
-	masterRemote:FireClient(player, outgoingBuffer)
+	task.spawn(request.thread, ...)
 end
 
-local function flushPlayerUnreliable(player)
-	local queue = unreliableQueueByPlayer[player]
-	if not queue or #queue == 0 then
-		return
-	end
-
-	local writer = bufferWriter.new()
-	writer:writeVarUInt(#queue)
-	for _, message in ipairs(queue) do
-		writeMessageWithId(writer, message)
-	end
-
-	statsSent.messages += #queue
-	table.clear(queue)
-	local outgoingBuffer = writer:toBuffer()
-	statsSent.bytes += buffer.len(outgoingBuffer)
-	masterUnreliableRemote:FireClient(player, outgoingBuffer)
+local function expireRequest(requestId, request)
+	request.timeout = nil
+	resolveRequest(requestId, request, false, 'timeout')
 end
 
-local function queueReliable(player, message)
-	local queue = reliableQueueByPlayer[player]
-	if not queue then
-		initializePlayerState(player)
-		queue = reliableQueueByPlayer[player]
+local function strike(state, reason)
+	state.strikes += 1
+	stats.droppedMessages += 1
+	if state.strikes == strikeWarnThreshold then
+		warn(('network: %s has sent %d invalid or rate-limited messages (latest: %s)'):format(state.player.Name, state.strikes, reason))
 	end
 
-	if #queue >= maxQueuedPerPlayer then
-		warn('network reliable queue overflow for ' .. player.Name .. ', forcing flush')
-		flushPlayerReliable(player)
-	end
-
-	table.insert(queue, message)
-	if #queue >= reliableFlushThreshold then
-		flushPlayerReliable(player)
-	end
+	net.Violation:fire(state.player, reason)
 end
 
-local function queueUnreliable(player, message)
-	local queue = unreliableQueueByPlayer[player]
-	if not queue then
-		initializePlayerState(player)
-		queue = unreliableQueueByPlayer[player]
-	end
-
-	if #queue >= maxQueuedPerPlayer then
-		warn('network unreliable queue overflow for ' .. player.Name .. ', dropping oldest')
-		table.remove(queue, 1)
-	end
-
-	table.insert(queue, message)
-	if #queue >= unreliableFlushThreshold then
-		flushPlayerUnreliable(player)
-	end
-end
-
-local function queueForPlayer(player, eventId, payload, unreliable)
-	local message = { kind = kindEvent, id = eventId, payload = payload }
-	if unreliable then
-		queueUnreliable(player, message)
-	else
-		queueReliable(player, message)
-	end
-end
-
-local function queueForAll(eventId, payload, unreliable)
-	for _, player in ipairs(players:GetPlayers()) do
-		queueForPlayer(player, eventId, payload, unreliable)
-	end
-end
-
-local function queueForExcept(excludedPlayer, eventId, payload, unreliable)
-	for _, player in ipairs(players:GetPlayers()) do
-		if player ~= excludedPlayer then
-			queueForPlayer(player, eventId, payload, unreliable)
-		end
-	end
-end
-
-local function queueForList(players, eventId, payload, unreliable)
-	for _, player in ipairs(players) do
-		queueForPlayer(player, eventId, payload, unreliable)
-	end
-end
-
-runService.Heartbeat:Connect(function()
-	for _, player in ipairs(players:GetPlayers()) do
-		flushPlayerReliable(player)
-		flushPlayerUnreliable(player)
-	end
-end)
-
-local function checkRateLimit(eventName, player, maxPerSecond)
-	if not maxPerSecond then
+local function allow(state, entry)
+	local rate = entry.rateLimit
+	if not rate then
 		return true
 	end
 
-	local perEvent = rateLimitState[eventName]
-	if not perEvent then
-		perEvent = {}
-		rateLimitState[eventName] = perEvent
-	end
-
-	local state = perEvent[player]
+	local id = entry.id
 	local now = os.clock()
-	if not state or now - state.windowStart >= 1 then
-		state = { count = 0, windowStart = now, violations = state and state.violations or 0 }
-		perEvent[player] = state
+	local tokens = state.tokens[id]
+	if tokens == nil then
+		tokens = rate
+	else
+		tokens = math.min(rate, tokens + (now - state.stamps[id]) * rate)
 	end
 
-	state.count += 1
-	if state.count > maxPerSecond then
-		state.violations += 1
-		if state.violations >= 10 then
-			warn('network rate limit repeatedly exceeded by ' .. player.Name .. ' on "' .. eventName .. '"')
-		end
+	state.stamps[id] = now
+	if tokens < 1 then
+		state.tokens[id] = tokens
 		return false
 	end
 
+	state.tokens[id] = tokens - 1
 	return true
 end
 
-local function processIncoming(player, packedBuffer)
-	local reader = bufferReader.new(packedBuffer)
-	statsReceived.bytes += buffer.len(packedBuffer)
-	local messageCount = reader:readVarUInt()
-	statsReceived.messages += messageCount
-	for _ = 1, messageCount do
-		local kind = reader:readUInt8()
-		if kind == kindEvent then
-			local eventId = reader:readVarUInt()
-			local payload = reader:readBuffer()
-			local eventName = nameById[eventId]
-			local eventObject = eventName and registeredEvents[eventName]
-			if eventObject and eventObject.onServerFire then
-				if checkRateLimit(eventName, player, eventObject.rateLimit) then
-					local unpackedPayload = codec.unpack(payload)
-					eventObject.onServerFire:fire(player, table.unpack(unpackedPayload))
-				end
-			end
-		elseif kind == kindRequest then
-			local eventId = reader:readVarUInt()
-			local requestId = reader:readVarUInt()
-			local payload = reader:readBuffer()
-			local eventName = nameById[eventId]
-			local eventObject = eventName and registeredEvents[eventName]
-			if eventObject and eventObject.onServerInvoke then
-				task.spawn(function()
-					local success, result = pcall(eventObject.onServerInvoke, player, codec.unpack(payload))
-					queueReliable(player, {
-						kind = kindResponse,
-						requestId = requestId,
-						success = success,
-						payload = codec.pack(result),
-					})
-				end)
-			end
-		elseif kind == kindResponse then
-			local requestId = reader:readVarUInt()
-			local success = reader:readUInt8() == 1
-			local payload = reader:readBuffer()
-			local thread = pendingRequests[requestId]
-			if thread then
-				pendingRequests[requestId] = nil
-				task.spawn(thread, success, codec.unpack(payload))
-			end
+local function runInvoke(entry, state, requestId, args)
+	local player = state.player
+	if playerStates[player] ~= state then
+		state.inflight -= 1
+		return
+	end
+
+	local results = table.pack(pcall(entry.handler, player, table.unpack(args, 1, args.n)))
+	state.inflight -= 1
+	if playerStates[player] ~= state then
+		return
+	end
+
+	local status, length, refCount = 0, 0, 0
+	if results[1] then
+		local encoded
+		encoded, length, refCount = pcall(codec.encodeArgs, entry.rets, table.unpack(results, 2, results.n))
+		if encoded then
+			status = 1
+		else
+			warn(('network function %s returned values that could not be sent: %s'):format(entry.name, tostring(length)))
+		end
+	else
+		warn(('network function %s errored: %s'):format(entry.name, tostring(results[2])))
+	end
+
+	if status == 0 then
+		length, refCount = codec.encodeArgs(nil, genericError)
+	end
+
+	appendMessage(state, nil, kindResponse, requestId, status, length, refCount)
+end
+
+local function handleResponse(state, requestId, status, source, start, finish, refBase, refCount)
+	local request = pendingRequests[requestId]
+	if not request or request.state ~= state or status > 1 then
+		strike(state, 'unexpected response')
+		return
+	end
+
+	local tuple = if status == 1 then request.entry.rets else nil
+	local success, count, args = pcall(codec.decodeArgs, tuple, source, start, finish, state.incomingRefs, refBase, refCount)
+	if not success then
+		strike(state, 'malformed response for ' .. request.entry.name)
+		resolveRequest(requestId, request, false, 'malformed response')
+	elseif status == 1 then
+		resolveRequest(requestId, request, true, table.unpack(args, 1, count))
+	else
+		resolveRequest(requestId, request, false, if type(args[1]) == 'string' then args[1] else 'client error')
+	end
+end
+
+local function handleMessage(state, kind, id, extra, source, start, finish, refBase, refCount)
+	if kind == kindResponse then
+		handleResponse(state, id, extra, source, start, finish, refBase, refCount)
+		return
+	end
+
+	local entry = entriesById[id]
+	if not entry or entry.from == 'Server' then
+		strike(state, 'unknown or server-only message ' .. id)
+		return
+	end
+
+	local expectedKind = if kind == kindEvent then 'event' elseif kind == kindRequest then 'function' else nil
+	if entry.kind ~= expectedKind then
+		strike(state, 'wrong message kind for ' .. entry.name)
+		return
+	end
+
+	if not allow(state, entry) then
+		strike(state, 'rate limit exceeded on ' .. entry.name)
+		return
+	end
+
+	local success, count, args = pcall(codec.decodeArgs, entry.tuple, source, start, finish, state.incomingRefs, refBase, refCount)
+	if not success then
+		strike(state, 'malformed ' .. entry.name .. ': ' .. tostring(count))
+		return
+	end
+
+	if kind == kindEvent then
+		entry.signal:fire(state.player, table.unpack(args, 1, count))
+		return
+	end
+
+	if state.inflight >= maxInflightRequests then
+		strike(state, 'too many concurrent requests on ' .. entry.name)
+		return
+	end
+
+	args.n = count
+	state.inflight += 1
+	if entry.handler then
+		task.spawn(runInvoke, entry, state, extra, args)
+		return
+	end
+
+	local waiting = entry.waiting
+	if #waiting >= maxWaitingRequests then
+		state.inflight -= 1
+		strike(state, 'no handler for ' .. entry.name)
+		return
+	end
+
+	table.insert(waiting, { state, extra, args })
+end
+
+local function processIncoming(player, data, ...)
+	local state = playerStates[player]
+	if not state then
+		return
+	end
+
+	if typeof(data) ~= 'buffer' then
+		strike(state, 'invalid packet')
+		return
+	end
+
+	local length = buffer.len(data)
+	local refTotal = select('#', ...)
+	if length > maxIncomingBytes or refTotal > maxIncomingRefs then
+		strike(state, 'packet too large')
+		return
+	end
+
+	stats.receivedBytes += length
+	state.incomingRefs = if refTotal > 0 then { ... } else emptyRefs
+	local success, result = pcall(packet.read, data, refTotal, handleMessage, state)
+	state.incomingRefs = emptyRefs
+	if success then
+		stats.receivedMessages += result
+	else
+		strike(state, 'malformed packet: ' .. tostring(result))
+	end
+end
+
+local function addPlayer(player)
+	if playerStates[player] then
+		return
+	end
+
+	local state = {
+		player = player,
+		reliable = packet.newBatch(),
+		unreliable = packet.newBatch(),
+		tokens = {},
+		stamps = {},
+		strikes = 0,
+		inflight = 0,
+		dirty = false,
+		incomingRefs = emptyRefs,
+	}
+	playerStates[player] = state
+	for _, entry in entriesById do
+		appendSync(state, entry)
+	end
+end
+
+local function removePlayer(player)
+	local state = playerStates[player]
+	if not state then
+		return
+	end
+
+	playerStates[player] = nil
+	for requestId, request in pendingRequests do
+		if request.state == state then
+			resolveRequest(requestId, request, false, 'player left')
 		end
 	end
 end
 
-export type ServerEventApi = {
-	FireClient: (self: ServerEventApi, player: Player, data: any) -> (),
-	FireAll: (self: ServerEventApi, data: any) -> (),
-	FireExcept: (self: ServerEventApi, excludedPlayer: Player, data: any) -> (),
-	FireList: (self: ServerEventApi, players: { Player }, data: any) -> (),
-	Connect: (self: ServerEventApi, callback: (Player, any) -> ()) -> any,
-	Once: (self: ServerEventApi, callback: (Player, any) -> ()) -> any,
-}
+local function register(name, kind, options)
+	assert(type(name) == 'string' and #name > 0, 'network name must be a non-empty string')
+	local entry = entriesByName[name]
+	if entry then
+		if entry.kind ~= kind then
+			error(('network %s is already registered as an %s'):format(name, entry.kind), 3)
+		end
 
-function net.loadEvent(eventName: string, options: { unreliable: boolean?, rateLimit: number? }?): ServerEventApi
-	if registeredEvents[eventName] then
-		return registeredEvents[eventName]
+		return entry
 	end
 
-	local eventId = getOrCreateEventId(eventName)
-	local unreliable = options and options.unreliable or false
-	local rateLimit = options and options.rateLimit or 5
-	local eventApi = {} :: any
-	eventApi.onServerFire = signalModule.new()
-	eventApi.rateLimit = rateLimit
-
-	function eventApi:FireClient(player, ...)
-		local args = {...}
-		queueForPlayer(player, eventId, codec.pack(args), unreliable)
+	local definition = definitions[name]
+	if definition and definition.kind ~= kind then
+		error(('network %s is declared as an %s in the protocol'):format(name, definition.kind), 3)
 	end
 
-	function eventApi:FireAll(...)
-		local args = {...}
-		queueForAll(eventId, codec.pack(args), unreliable)
+	options = definition or options or {}
+	local rateLimit = options.rateLimit
+	local id = #entriesById + 1
+	entry = {
+		id = id,
+		name = name,
+		kind = kind,
+		unreliable = options.unreliable == true,
+		tuple = idl.resolveTuple(options.data, aliases),
+		rets = idl.resolveTuple(options.rets, aliases),
+		from = options.from,
+		rateLimit = if rateLimit == nil then defaultRateLimit elseif rateLimit == false then nil else rateLimit,
+		timeout = options.timeout or defaultTimeout,
+		signal = if kind == 'event' then signal.new() else nil,
+		waiting = if kind == 'function' then {} else nil,
+		handler = nil,
+		oversizeWarned = false,
+	}
+	entriesByName[name] = entry
+	entriesById[id] = entry
+	entry.api = setmetatable({ entry = entry, Name = name }, if kind == 'event' then eventMeta else functionMeta)
+	for _, state in playerStates do
+		appendSync(state, entry)
 	end
 
-	function eventApi:FireExcept(excludedPlayer, ...)
-		local args = {...}
-		queueForExcept(excludedPlayer, eventId, codec.pack(args), unreliable)
-	end
-
-	function eventApi:FireList(players, ...)
-		local args = {...}
-		queueForList(players, eventId, codec.pack(args), unreliable)
-	end
-
-	function eventApi:Connect(callback)
-		return eventApi.onServerFire:connect(callback)
-	end
-
-	function eventApi:Once(callback)
-		return eventApi.onServerFire:once(callback)
-	end
-
-	registeredEvents[eventName] = eventApi
-	return eventApi
+	return entry
 end
 
-export type ServerFunctionApi = {
-	OnInvoke: (self: ServerFunctionApi, callback: (Player, any) -> any) -> (),
-	InvokeClient: (self: ServerFunctionApi, player: Player, data: any) -> (boolean, any),
-}
+local function assertServerCanSend(entry)
+	if entry.from == 'Client' then
+		error(('network %s can only be sent by clients'):format(entry.name), 3)
+	end
+end
 
-function net.loadFunction(eventName: string): ServerFunctionApi
-	if registeredEvents[eventName] then
-		return registeredEvents[eventName]
+function eventMeta:FireClient(player, ...)
+	local entry = self.entry
+	assertServerCanSend(entry)
+	local state = playerStates[player]
+	if not state then
+		return
 	end
 
-	local eventId = getOrCreateEventId(eventName)
-	local eventApi = {} :: any
+	local length, refCount = codec.encodeArgs(entry.tuple, ...)
+	appendMessage(state, entry, kindEvent, entry.id, 0, length, refCount)
+end
 
-	function eventApi:OnInvoke(callback)
-		eventApi.onServerInvoke = callback
+function eventMeta:FireAll(...)
+	local entry = self.entry
+	assertServerCanSend(entry)
+	local length, refCount = codec.encodeArgs(entry.tuple, ...)
+	for _, state in playerStates do
+		appendMessage(state, entry, kindEvent, entry.id, 0, length, refCount)
+	end
+end
+
+function eventMeta:FireExcept(excludedPlayer, ...)
+	local entry = self.entry
+	assertServerCanSend(entry)
+	local length, refCount = codec.encodeArgs(entry.tuple, ...)
+	for player, state in playerStates do
+		if player ~= excludedPlayer then
+			appendMessage(state, entry, kindEvent, entry.id, 0, length, refCount)
+		end
+	end
+end
+
+function eventMeta:FireList(playerList, ...)
+	local entry = self.entry
+	assertServerCanSend(entry)
+	local length, refCount = codec.encodeArgs(entry.tuple, ...)
+	for _, player in playerList do
+		local state = playerStates[player]
+		if state then
+			appendMessage(state, entry, kindEvent, entry.id, 0, length, refCount)
+		end
+	end
+end
+
+function eventMeta:Connect(callback)
+	return self.entry.signal:connect(callback)
+end
+
+function eventMeta:Once(callback)
+	return self.entry.signal:once(callback)
+end
+
+function eventMeta:Wait()
+	return self.entry.signal:wait()
+end
+
+function functionMeta:OnInvoke(callback)
+	local entry = self.entry
+	entry.handler = callback
+	if callback and #entry.waiting > 0 then
+		local waiting = entry.waiting
+		entry.waiting = {}
+		for _, request in waiting do
+			task.spawn(runInvoke, entry, request[1], request[2], request[3])
+		end
+	end
+end
+
+function functionMeta:InvokeClient(player, ...)
+	local entry = self.entry
+	assertServerCanSend(entry)
+	local state = playerStates[player]
+	if not state then
+		return false, 'player not connected'
 	end
 
-	function eventApi:InvokeClient(player, ...)
-		local args = {...}
-		local timeoutSeconds = 5
-		local requestId = nextRequestId
-		nextRequestId += 1
-		local thread = coroutine.running()
-		pendingRequests[requestId] = thread
-		queueReliable(player, { kind = kindRequest, id = eventId, requestId = requestId, payload = codec.pack(args) })
-		flushPlayerReliable(player)
-		local timeoutHandle = task.delay(timeoutSeconds, function()
-			if pendingRequests[requestId] then
-				pendingRequests[requestId] = nil
-				task.spawn(thread, false, 'timeout')
-			end
-		end)
-		local success, result = coroutine.yield()
-		task.cancel(timeoutHandle)
-		return success, result
+	local length, refCount = codec.encodeArgs(entry.tuple, ...)
+	nextRequestId = nextRequestId % maxRequestId + 1
+	local requestId = nextRequestId
+	local request = { thread = coroutine.running(), state = state, entry = entry, timeout = nil }
+	pendingRequests[requestId] = request
+	appendMessage(state, entry, kindRequest, entry.id, requestId, length, refCount)
+	request.timeout = task.delay(entry.timeout, expireRequest, requestId, request)
+	return coroutine.yield()
+end
+
+function net.loadEvent(name: string, options: { unreliable: boolean?, rateLimit: (number | false)?, data: any?, from: string? }?): ServerEventApi
+	return register(name, 'event', options).api
+end
+
+function net.loadFunction(name: string, options: { rateLimit: (number | false)?, timeout: number?, data: any?, rets: any?, from: string? }?): ServerFunctionApi
+	return register(name, 'function', options).api
+end
+
+function net.define(source)
+	local parsed = if type(source) == 'string' then idl.parse(source) else source
+	for name, typeObject in parsed.types or {} do
+		aliases[name] = typeObject
 	end
 
-	registeredEvents[eventName] = eventApi
-	return eventApi
+	local names = {}
+	for name, definition in parsed.events or {} do
+		definition.kind = 'event'
+		definitions[name] = definition
+		table.insert(names, name)
+	end
+
+	for name, definition in parsed.functions or {} do
+		definition.kind = 'function'
+		definitions[name] = definition
+		table.insert(names, name)
+	end
+
+	table.sort(names)
+	local apis = {}
+	for _, name in names do
+		apis[name] = register(name, definitions[name].kind, nil).api
+	end
+
+	return apis
 end
 
 function net.getStats()
-	return {
-		sentBytes = statsSent.bytes,
-		sentMessages = statsSent.messages,
-		receivedBytes = statsReceived.bytes,
-		receivedMessages = statsReceived.messages,
-	}
+	return table.clone(stats)
 end
 
+for _, player in players:GetPlayers() do
+	addPlayer(player)
+end
+
+local protocolModule = network:FindFirstChild('Protocol')
+if protocolModule then
+	net.define(require(protocolModule))
+end
+
+players.PlayerAdded:Connect(addPlayer)
+players.PlayerRemoving:Connect(removePlayer)
 masterRemote.OnServerEvent:Connect(processIncoming)
 masterUnreliableRemote.OnServerEvent:Connect(processIncoming)
+runService.Heartbeat:Connect(function()
+	local count = dirtyCount
+	dirtyCount = 0
+	for index = 1, count do
+		local state = dirtyStates[index]
+		dirtyStates[index] = nil
+		if playerStates[state.player] == state then
+			local success, result = pcall(flushState, state)
+			if not success then
+				warn('network flush failed for ' .. state.player.Name .. ': ' .. tostring(result))
+			end
+		else
+			state.dirty = false
+		end
+	end
+end)
+
 return net

@@ -1,48 +1,53 @@
 local enums = {}
-
 local tagNames = {
 	'Nil',
 	'False',
 	'True',
-	'Integer',
-	'Float',
+	'UInt',
+	'NegInt',
+	'Float32',
+	'Float64',
 	'String',
-	'Vector3',
+	'StringRef',
+	'InternedString',
 	'Array',
-	'Dictionary',
+	'Map',
 	'Buffer',
-	'Extended',
-}
-
-local extNames = {
 	'Instance',
-	'Player',
+	'Vector3',
+	'Vector2',
 	'CFrame',
 	'Color3',
-	'BrickColor',
 	'UDim',
 	'UDim2',
-	'Vector2',
-	'Vector2int16',
-	'Vector3int16',
+	'BrickColor',
 	'EnumItem',
 	'NumberRange',
 	'Rect',
 	'DateTime',
 	'ColorSequence',
 	'NumberSequence',
+	'Vector2int16',
+	'Vector3int16',
 }
-
+local kindNames = {
+	'Event',
+	'Request',
+	'Response',
+	'Sync',
+}
 local tag = {}
-local ext = {}
+local kind = {}
 enums.tag = tag
-enums.ext = ext
+enums.kind = kind
+enums.shortStringRefBase = 64
+enums.smallIntBase = 128
 for index, tagName in ipairs(tagNames) do
 	tag[tagName] = index - 1
 end
 
-for index, extName in ipairs(extNames) do
-	ext[extName] = index
+for index, kindName in ipairs(kindNames) do
+	kind[kindName] = index - 1
 end
 
 return enums
