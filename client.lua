@@ -6,6 +6,7 @@ local packet = require(modules:WaitForChild('Packet'))
 local signal = require(modules:WaitForChild('Signal'))
 local idl = require(modules:WaitForChild('Idl'))
 local enums = require(modules:WaitForChild('Enums'))
+local actions = require(modules:WaitForChild('Actions'))
 local masterRemote = network:WaitForChild('__Master')
 local masterUnreliableRemote = network:WaitForChild('__MasterUnreliable')
 local net = {}
@@ -23,12 +24,15 @@ local unreliableBatch = packet.newBatch()
 local stats = { sentBytes = 0, sentMessages = 0, receivedBytes = 0, receivedMessages = 0, droppedMessages = 0 }
 local eventMeta = {}
 local functionMeta = {}
+local actionSpecs = {}
+local reasons = actions.reasons
 local kindEvent, kindRequest, kindResponse, kindSync = enums.kind.Event, enums.kind.Request, enums.kind.Response, enums.kind.Sync
 local incomingRefs = emptyRefs
 local pendingSendCount = 0
 local nextRequestId = 0
 local dirty = false
 local defaultTimeout = 3
+local actionTimeout = 10
 local unreliableBudget = 800
 local maxBatchRefs = 250
 local maxPendingSends = 512
@@ -41,6 +45,9 @@ eventMeta.__index = eventMeta
 functionMeta.__index = functionMeta
 net.codec = codec
 net.types = codec.types
+net.validators = actions.validators
+net.ActionReason = reasons
+net.actionFailed = signal.new()
 
 export type ClientEventApi = {
 	Name: string,
@@ -55,6 +62,8 @@ export type ClientFunctionApi = {
 	OnInvoke: (self: ClientFunctionApi, callback: (...any) -> ...any) -> (),
 	InvokeServer: (self: ClientFunctionApi, ...any) -> (boolean, ...any),
 }
+
+export type ActionReason = 'RateLimited' | 'Cooldown' | 'UnknownAction' | 'InvalidArguments' | 'Unavailable' | 'Timeout' | 'Rejected'
 
 local function sendBatch(remote, batch)
 	local data, refs, refCount, messages = packet.take(batch)
@@ -141,7 +150,81 @@ end
 
 local function expireRequest(requestId, request)
 	request.timeout = nil
-	resolveRequest(requestId, request, false, 'timeout')
+	resolveRequest(requestId, request, false, if request.entry.kind == 'action' then reasons.Timeout else 'timeout')
+end
+
+local function sendAction(entry, kind, requestId, ...)
+	if idByName[entry.name] then
+		local length, refCount = codec.encodeArgs(entry.tuple, ...)
+		return appendMessage(entry, kind, requestId, length, refCount)
+	end
+
+	if pendingSendCount >= maxPendingSends then
+		stats.droppedMessages += 1
+		warn(('network send queue is full, dropping action %s (the server has not bound it)'):format(entry.name))
+		return false
+	end
+
+	local deferred = entry.deferred
+	if not deferred then
+		deferred = {}
+		entry.deferred = deferred
+	end
+
+	table.insert(deferred, table.pack(kind, requestId, ...))
+	pendingSendCount += 1
+	return true
+end
+
+local function flushDeferred(entry)
+	local deferred = entry.deferred
+	entry.deferred = nil
+	pendingSendCount -= #deferred
+	for _, call in deferred do
+		local kind, requestId = call[1], call[2]
+		local success, length, refCount = pcall(codec.encodeArgs, entry.tuple, table.unpack(call, 3, call.n))
+		if success then
+			appendMessage(entry, kind, requestId, length, refCount)
+		else
+			stats.droppedMessages += 1
+			warn(('network action %s could not be sent: %s'):format(entry.name, tostring(length)))
+			local request = pendingRequests[requestId]
+			if kind == kindRequest and request then
+				resolveRequest(requestId, request, false, reasons.InvalidArguments)
+			end
+		end
+	end
+end
+
+local function loadAction(name)
+	local entry = entriesByName[name]
+	if not entry then
+		return nil
+	end
+
+	if entry.kind ~= 'action' then
+		error(('network %s is registered as an %s, not an action'):format(name, entry.kind), 3)
+	end
+
+	return entry
+end
+
+local function setActionSpec(name, source)
+	local tuple = nil
+	if source ~= '' then
+		local success, result = pcall(idl.parseTuple, source, aliases)
+		if success then
+			tuple = result
+		else
+			warn(('network action %s has argument types this client cannot parse: %s'):format(name, tostring(result)))
+		end
+	end
+
+	actionSpecs[name] = tuple
+	local entry = entriesByName[name]
+	if entry and entry.kind == 'action' then
+		entry.tuple = tuple
+	end
 end
 
 local function runInvoke(entry, requestId, args)
@@ -211,6 +294,11 @@ end
 local function handleSync(id, name)
 	nameById[id] = name
 	idByName[name] = id
+	local entry = entriesByName[name]
+	if entry and entry.deferred then
+		flushDeferred(entry)
+	end
+
 	local queue = pendingSends[name]
 	if not queue then
 		return
@@ -218,7 +306,6 @@ local function handleSync(id, name)
 
 	pendingSends[name] = nil
 	pendingSendCount -= #queue
-	local entry = entriesByName[name]
 	for _, message in queue do
 		appendRaw(entry, message.kind, id, message.extra, message.payload, message.length, message.refs, message.refCount)
 	end
@@ -329,6 +416,7 @@ local function register(name, kind, options)
 		signal = if kind == 'event' then signal.new() else nil,
 		queued = {},
 		waiting = {},
+		deferred = nil,
 		handler = nil,
 		oversizeWarned = false,
 	}
@@ -449,9 +537,41 @@ function net.define(source)
 	return apis
 end
 
+function net.invokeAction(name: string, ...: any)
+	local entry = loadAction(name) or register(name, 'action', { data = actionSpecs[name] })
+	sendAction(entry, kindEvent, 0, ...)
+end
+
+function net.requestAction(name: string, ...: any): (boolean, string?)
+	local entry = loadAction(name) or register(name, 'action', { data = actionSpecs[name] })
+	nextRequestId = nextRequestId % maxRequestId + 1
+	local requestId = nextRequestId
+	if not sendAction(entry, kindRequest, requestId, ...) then
+		return false, reasons.Unavailable
+	end
+
+	local request = { thread = coroutine.running(), entry = entry, timeout = nil }
+	pendingRequests[requestId] = request
+	request.timeout = task.delay(actionTimeout, expireRequest, requestId, request)
+	return coroutine.yield()
+end
+
+function net.setActionTimeout(seconds: number)
+	assert(type(seconds) == 'number' and seconds > 0, 'network action timeout must be a positive number')
+	actionTimeout = seconds
+end
+
 function net.getStats()
 	return table.clone(stats)
 end
+
+net.loadEvent('__ActionSpec', { from = 'Server', data = '(string, string)' }):Connect(setActionSpec)
+net.loadEvent('__ActionFailed', { from = 'Server', data = '(uint, string)' }):Connect(function(id, reason)
+	local name = nameById[id]
+	if name then
+		net.actionFailed:fire(name, reason)
+	end
+end)
 
 local protocolModule = network:FindFirstChild('Protocol')
 if protocolModule then

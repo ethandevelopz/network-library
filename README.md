@@ -24,6 +24,7 @@ All events and functions are multiplexed over two remotes (one reliable, one unr
   * Concurrency cap on server functions.
   * Direction enforcement (`from: Client` / `from: Server`).
   * A `Violation` signal you can use to kick abusers.
+* **Action registry:** `net.bindAction` gives every client request the same pipeline: global and per-action token buckets, argument count and validation, cooldown, middleware, then your handler. See [Actions](#actions).
 * **Unreliable-safe:** unreliable batches are split to stay under the unreliable remote's size limit. A single message too big for an unreliable remote is sent reliably, with a one-time warning.
 * **Late-join safe:**
   * Client events that arrive before your `Connect` are queued and delivered on connect, like a normal RemoteEvent.
@@ -35,7 +36,7 @@ All events and functions are multiplexed over two remotes (one reliable, one unr
 ## Installation & Setup
 
 * **ReplicatedStorage (`ReplicatedStorage.Network`)**
-  * Place the **Modules** folder inside `Network`. It contains `Codec`, `Enums`, `Idl`, `Packet`, `Reader`, `Signal` and `Writer` (all ModuleScripts).
+  * Place the **Modules** folder inside `Network`. It contains `Actions`, `Codec`, `Enums`, `Idl`, `Packet`, `Reader`, `Signal` and `Writer` (all ModuleScripts).
   * Place **`Client.lua`** inside `Network` (ModuleScript named `Client`).
   * Create **`__Master`** (`RemoteEvent`) inside `Network`.
   * Create **`__MasterUnreliable`** (`UnreliableRemoteEvent`) inside `Network`.
@@ -143,6 +144,132 @@ Declaration options:
 
 ---
 
+## Actions
+
+An action is a named client request with its checks declared next to the handler. Actions use the same two remotes, Heartbeat batches, codec, rate limiter, `net.Violation` and `net.getStats()` as events and functions. Action names are synced once as varint ids, so no name string travels per call and no rate-limit key is ever built from a client string.
+
+Server:
+
+```lua
+local net = require(game.ServerScriptService.Network.Server)
+local v = net.validators
+local reason = net.ActionReason
+local slots = { 'Head', 'Body', 'Feet' }
+local loadedProfiles = {}
+
+net.useActionMiddleware('ProfileLoaded', function(player, actionName, ...)
+	return loadedProfiles[player] == true, reason.Unavailable
+end)
+
+net.bindAction('EquipItem', {
+	rate = 'normal',
+	cooldown = 0.25,
+	requires = { 'ProfileLoaded' },
+	args = { v.guid, v.integer(1, 99), v.optional(v.oneOf(slots)) },
+}, function(player, itemId, amount, slot)
+	if not inventory.owns(player, itemId, amount) then
+		return false, 'NotOwned'
+	end
+
+	inventory.equip(player, itemId, amount, slot)
+	return true
+end)
+
+net.bindActions({
+	DropItem = { { rate = 'slow', args = '(string(..36), u16)' }, function(player, itemId, amount)
+		return inventory.drop(player, itemId, amount)
+	end },
+	Ping = { { rate = 'fast', maxArgs = 0 }, function(player)
+		return true
+	end },
+	Rename = { { rate = 2, burst = 4, maxArgs = 1, validate = function(name)
+		return type(name) == 'string' and #name <= 20
+	end }, function(player, name)
+		return pets.rename(player, name)
+	end },
+})
+
+net.Violation:Connect(function(player, why)
+	print(player.Name, why)
+end)
+
+net.setActionDebug(true)
+local equipStats = net.getStats().actions.EquipItem
+print(equipStats.calls, equipStats.rejects.Cooldown, equipStats.averageHandlerTime)
+net.unbindAction('Ping')
+```
+
+Client:
+
+```lua
+local net = require(game.ReplicatedStorage.Network.Client)
+
+net.actionFailed:Connect(function(name, why)
+	warn(name, 'failed:', why)
+end)
+
+net.invokeAction('EquipItem', itemId, 1, 'Head')
+
+local ok, why = net.requestAction('DropItem', itemId, 5)
+if not ok and why == net.ActionReason.Timeout then
+	warn('server did not answer')
+end
+```
+
+### Dispatch order
+
+Every incoming action runs these steps. The first one that fails stops the call.
+
+1. The player's global bucket across all actions (50/s, burst 100).
+2. The action lookup by id. An unbound action is rejected with `UnknownAction`. An id the server never registered is rejected by the packet layer before this point.
+3. The action's own token bucket (`rate`, `burst`), then its `cooldown`.
+4. Decoding with the codec (typed when `args` is an IDL string), then the argument count against `maxArgs`, then validation.
+5. Middleware listed in `requires`, in order, then the handler. Nothing yields between validation and the handler call, so middleware must not yield.
+
+Steps 1 to 4 are rejections: the call is dropped, `net.Violation` fires with `action <Name>: <Reason>`, and the player is warned about once, at 10 violations. Nobody is kicked. A middleware or handler that returns `false, reason` is an outcome, not a violation: the caller gets `(name, reason)` through `net.actionFailed`, or as the result of `requestAction`.
+
+`requestAction` gets an answer for every rejection except the global bucket, which drops silently so a flood cannot make the server reply.
+
+### Options
+
+| Option | Meaning |
+|---|---|
+| `rate` | `'fast'` (20/s, burst 40), `'normal'` (5/s, burst 10, the default), `'slow'` (1/s, burst 3), `'rare'` (0.2/s, burst 2), or tokens per second. |
+| `burst` | Bucket size. Defaults to the preset's burst, or twice a numeric rate. |
+| `cooldown` | Minimum seconds between two accepted calls from one player. Rejected with `Cooldown`. |
+| `args` | A list of validators, one per argument (sets `maxArgs`), or an IDL tuple string such as `'(string(..36), u16)'`. With an IDL string the codec types the arguments on both sides and no validator runs. The server sends the tuple to clients, so clients declare nothing. |
+| `validate` | `fn(...) -> boolean`, as an alternative to `args`. Passing both is an error. |
+| `maxArgs` | Largest accepted argument count. Defaults to the length of `args`, or 8. |
+| `requires` | Names of middleware registered with `net.useActionMiddleware`. |
+
+Bad options error when you bind: an unknown preset or option, a missing handler, both `args` and `validate`, unknown middleware in `requires`, a non-positive rate, burst or cooldown, or a name that is already bound.
+
+### Validators (`net.validators`, server and client)
+
+Each one takes a value and returns a boolean, so they combine freely.
+
+| Validator | Accepts |
+|---|---|
+| `integer(min?, max?)` | A whole number in the range. NaN, infinity and fractions fail. |
+| `string(maxLength, allowed?)` | A string up to `maxLength` bytes. With `allowed` (list or set) it must be a member, otherwise it must be valid UTF-8. |
+| `guid` | A 36-character GUID without braces. |
+| `optional(validator)` | `nil`, or a value the inner validator accepts. |
+| `oneOf(listOrSet)` | A member of the set. |
+| `player` | A Player connected to this server. |
+| `otherPlayer` | A connected Player other than the sender. |
+| `boolean` | `true` or `false`. |
+| `vector3(maxMagnitude)` | A Vector3 with finite components and a magnitude up to the cap. |
+
+### Failure reasons (`net.ActionReason`)
+
+`RateLimited`, `Cooldown`, `UnknownAction`, `InvalidArguments`, `Unavailable` (middleware said no without a reason, the handler errored, or the player has 16 handlers still running), `Timeout` (client side, `requestAction` got no answer), `Rejected` (the handler returned `false` without a reason). Handlers and middleware can return their own strings, clamped to 96 bytes.
+
+### Debug mode
+
+`net.setActionDebug(enabled)` is on by default in Studio and off in live servers. When on, every rejection prints one line with the reason and a short argument summary, and `net.getStats().actions[name]` holds `{ calls, rejects = { [reason] = count }, averageHandlerTime }`. When off, nothing is counted or formatted.
+
+---
+
 ## API
 
 ### Server (`ServerScriptService.Network.Server`)
@@ -155,14 +282,23 @@ Declaration options:
   * `:InvokeClient(player, ...) -> (success, ...)`. Treat client results as untrusted.
 * `net.define(idlStringOrTable)` registers protocol declarations and returns `{ [name] = api }`.
 * `net.Violation`: a signal fired with `(player, reason)` for every rejected message (rate limit, malformed, spoofed, wrong direction).
-* `net.getStats()` returns `{ sentBytes, sentMessages, receivedBytes, receivedMessages, droppedMessages }`.
+* `net.getStats()` returns `{ sentBytes, sentMessages, receivedBytes, receivedMessages, droppedMessages, actions }`.
 * `net.codec`, `net.types`: the codec and the built-in type objects.
+* `net.bindAction(name, options?, handler(player, ...) -> (ok, reason?))`, `net.bindActions({ [name] = { options, handler } })`, `net.unbindAction(name) -> boolean`.
+* `net.useActionMiddleware(name, fn(player, actionName, ...) -> (ok, reason?))`. Registering a name again replaces it.
+* `net.setActionDebug(enabled)`, `net.validators`, `net.ActionReason`.
+* Types: `ActionOptions`, `ActionHandler`, `ActionMiddleware`, `ActionValidator`, `ActionRate`, `ActionReason`, `ActionStats`.
 
 ### Client (`ReplicatedStorage.Network.Client`)
 
 * `net.loadEvent(name, { unreliable?, data?, from? })` returns an event with `:FireServer(...)`, `:Connect`, `:Once`, `:Wait`.
 * `net.loadFunction(name, { timeout?, data?, rets?, from? })` returns a function with `:OnInvoke(fn(...) -> ...)` and `:InvokeServer(...) -> (success, ...)`.
 * `net.define`, `net.getStats`, `net.codec`, `net.types`.
+* `net.invokeAction(name, ...)`: fire-and-forget.
+* `net.requestAction(name, ...) -> (ok, reason?)`: yields until the server answers or the timeout passes.
+* `net.setActionTimeout(seconds)`: timeout for `requestAction`, 10 s by default.
+* `net.actionFailed`: a signal fired with `(name, reason)` when an `invokeAction` call is turned down by middleware or its handler.
+* `net.validators`, `net.ActionReason`.
 
 ### Codec (`Modules.Codec`)
 
@@ -176,7 +312,9 @@ Declaration options:
 | Setting | Value |
 |---|---|
 | Rate limit per event/function per player | 5/s (token bucket, burst 5). Pass `rateLimit = false` to disable. |
+| Action rate | `'normal'`: 5/s, burst 10 per action per player. All actions together: 50/s, burst 100 per player. |
 | Function timeout | server 5 s, client 3 s |
+| `requestAction` timeout | 10 s |
 | Concurrent server invokes per player | 16 |
 | Max incoming packet | 64 KB, 256 instance refs |
 | Unreliable batch budget | 800 B (Roblox drops unreliable payloads over ~900 B) |
@@ -194,7 +332,7 @@ Declaration options:
 
 ## Tests & benchmarks
 
-This version was verified with a 36-test suite: codec, IDL, signal, end-to-end, and exploit/fuzz cases. The suite runs the real server and client modules against an emulated Roblox (instance tree, Players, Heartbeat, remotes with copy semantics, unreliable size cap, unreplicated instances) under [Lune](https://github.com/lune-org/lune). It was also benchmarked against the previous version. The test and benchmark tooling is kept out of this repository.
+This version was verified with a 56-test suite: codec, IDL, signal, end-to-end, exploit/fuzz and action cases. The suite runs the real server and client modules against an emulated Roblox (instance tree, Players, Heartbeat, remotes with copy semantics, unreliable size cap, unreplicated instances) under [Lune](https://github.com/lune-org/lune). It was also benchmarked against the previous version. The test and benchmark tooling is kept out of this repository.
 
 Highlights (10 players, 120 frames):
 
